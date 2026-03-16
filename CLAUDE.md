@@ -303,6 +303,35 @@ SYSTem:STReam:LOSS:WINDow?           # Query current override (0=auto)
 
 **Implementation:** `firmware/src/services/streaming.c` (gQuesBits, flow window), `firmware/src/services/SCPI/SCPIInterface.c` (OPER/QUES helpers, sync)
 
+#### Test Pattern Streaming Mode
+
+Test pattern mode replaces real ADC values with synthetic data for deterministic regression testing and benchmarking. The real ISR timing, ADC triggering, pool allocation, and full encoding pipeline are preserved — only the sample Value field is overridden.
+
+**SCPI Commands:**
+```bash
+SYSTem:STReam:TESTpattern <pattern>   # Set pattern (0=off, 1-6)
+SYSTem:STReam:TESTpattern?            # Query current pattern (0=disabled)
+```
+
+**Pattern Types:**
+
+| Pattern | Name | Value Generated | Use Case |
+|---------|------|----------------|----------|
+| 0 | Off | Real ADC data | Normal operation |
+| 1 | Counter | `(sampleCount + channelId) % (adcMax+1)` | Integrity verification (PC can predict exact values) |
+| 2 | Midscale | `adcMax / 2` | Consistent encoding size across CSV/JSON/ProtoBuf |
+| 3 | Fullscale | `adcMax` | Worst-case ProtoBuf variable-length encoding |
+| 4 | Walking | `(sampleCount * (channelId+1)) % (adcMax+1)` | Multi-channel visual verification |
+| 5 | Triangle | Ramps 0→adcMax→0, period=2*(adcMax+1) | Realistic waveform, staggered per channel |
+| 6 | Sine | 256-sample sine wave, scaled to [0, adcMax] | Realistic signal testing, 45deg phase offset per channel |
+
+- `adcMax` = max raw ADC code = Resolution - 1 (4095 for MC12bADC 12-bit, 262143 for AD7609 18-bit)
+- Runtime-only (not persisted to NVM, resets on reboot)
+- Sample counter resets at each `StartStreamData` for deterministic sessions
+- Works with all encoding formats (CSV/JSON/ProtoBuf) and output interfaces (USB/WiFi/SD)
+
+**Implementation:** `firmware/src/services/streaming.c` (gTestPattern, Streaming_GenerateTestValue)
+
 ### Board Variants
 
 - **NQ1**: Basic variant configuration
@@ -358,7 +387,7 @@ The PIC32MZ2048**EF**M144 has a hardware 64-bit double-precision FPU (Coprocesso
 
 - **Compiler**: targeting `PIC32MZ2048EFM144` implicitly sets `__mips_hard_float = 1`
 - **FreeRTOS**: `configUSE_TASK_FPU_SUPPORT = 1` in `FreeRTOSConfig.h`; saves/restores 32×64-bit FPU registers on context switches for tasks that call `portTASK_USES_FLOATING_POINT()`
-- **Registered tasks**: USB, WiFi, PowerAndUI, and streaming tasks use FPU
+- **Registered tasks**: USB, WiFi, PowerAndUI, streaming, and deferred interrupt tasks use FPU
 - **ADC voltage conversion**: `ADC_ConvertToVoltage()` uses native `mul.d`, `div.d`, `add.d` instructions
 
 ### Memory Considerations
