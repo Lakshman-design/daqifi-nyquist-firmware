@@ -1695,6 +1695,7 @@ static scpi_result_t SCPI_StartStreaming(scpi_t * context) {
 
     //int i;
     uint16_t activeType1ChannelCount = 0;
+    uint16_t totalEnabledPublicChannels = 0;
     bool hasActiveAD7609Channels __attribute__((unused)) = false;
     int i;
     bool hasEnabledChannels = false;
@@ -1713,11 +1714,13 @@ static scpi_result_t SCPI_StartStreaming(scpi_t * context) {
                 if (isPublic) {
                     hasEnabledChannels = true;
                     hasActiveAD7609Channels = true;
+                    totalEnabledPublicChannels++;
                 }
             } else if (pBoardConfigADC->Data[i].Type == AIn_MC12bADC) {
                 isPublic = pBoardConfigADC->Data[i].Config.MC12b.IsPublic;
                 if (isPublic) {
                     hasEnabledChannels = true;
+                    totalEnabledPublicChannels++;
                     if (pBoardConfigADC->Data[i].Config.MC12b.ChannelType == 1) {
                         activeType1ChannelCount++;
                     }
@@ -1754,33 +1757,22 @@ static scpi_result_t SCPI_StartStreaming(scpi_t * context) {
             freq = 1; // Override to 1Hz for internal monitoring when external ADC active
         }
 
-        // Maximum frequency limited to 15kHz pending optimization
-        // See https://github.com/daqifi/daqifi-nyquist-firmware/issues/58
-        if (freq >= 1 && freq <= 15000)
+        // Three-constraint frequency capping (validated via benchmark testing)
+        // See https://github.com/daqifi/daqifi-nyquist-firmware/issues/215
         {
-            /**
-             * The maximum aggregate trigger frequency for all active Type 1 ADC channels is 15,000 Hz.
-             * For example, if two Type 1 channels are active, each can trigger at a maximum frequency of 7,500 Hz (15,000 / 2).
-             *
-             * The maximum triggering frequency of non type 1 channel is 1000 hz,
-             * which is obtained by dividing Frequency with ChannelScanFreqDiv.
-             * Non-Type 1 channels are setup for channel scanning
-             *
-             */
-            if (activeType1ChannelCount > 0) {
-                // Avoid overflow: compare without multiplying freq * activeType1ChannelCount
-                // Instead of: (freq * activeType1ChannelCount) > 15000
-                // Use: freq > (15000 / activeType1ChannelCount)
-                if (freq > (15000 / activeType1ChannelCount)) {
-                    freq = 15000 / activeType1ChannelCount;
-
-                    // Prevent divide-by-zero: if too many channels active, return error
-                    if (freq == 0) {
-                        SCPI_ErrorPush(context, SCPI_ERROR_ILLEGAL_PARAMETER_VALUE);
-                        return SCPI_RES_ERR;
-                    }
-                }
+            uint32_t maxFreq = Streaming_ComputeMaxFreq(
+                activeType1ChannelCount, totalEnabledPublicChannels);
+            if (freq > (int32_t)maxFreq) {
+                LOG_I("Frequency capped: %d Hz -> %u Hz (%u ch, %u type1)",
+                      (int)freq, (unsigned)maxFreq,
+                      (unsigned)totalEnabledPublicChannels,
+                      (unsigned)activeType1ChannelCount);
+                freq = (int32_t)maxFreq;
             }
+        }
+
+        if (freq >= 1 && freq <= (int32_t)STREAMING_ISR_MAX_HZ)
+        {
 
             // Note: Internal monitoring channels have fixed 1Hz in NQ3 runtime config
 

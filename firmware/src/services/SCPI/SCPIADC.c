@@ -18,6 +18,7 @@
 #include "HAL/ADC.h"
 #include "../daqifi_settings.h"
 #include "HAL/TimerApi/TimerApi.h"
+#include "../streaming.h"
 
 // FreeRTOS
 #include "FreeRTOS.h"
@@ -198,35 +199,45 @@ scpi_result_t SCPI_ADCChanEnableSet(scpi_t * context) {
         // Note: Monitoring channels (>maxUserChannel) are always enabled and not user-controllable
     }
     uint16_t activeType1ChannelCount = 0;
+    uint16_t totalEnabledPublicChannels = 0;
     bool hasActiveAD7609Channels __attribute__((unused)) = false;
     uint64_t freq = pRunTimeStreamConfig->Frequency;
     uint32_t clkFreq = TimerApi_FrequencyGet(pBoardConfig->StreamingConfig.TimerIndex);
     int i;
-    
+
     // Count active channels and detect AD7609 usage
     for (i = 0; i < pBoardConfigAInChannels->Size; i++) {
         if (pRuntimeAInChannels->Data[i].IsEnabled == 1) {
+            bool isPublic = false;
             if (pBoardConfigAInChannels->Data[i].Type == AIn_AD7609) {
-                hasActiveAD7609Channels = true;
-            } else if (pBoardConfigAInChannels->Data[i].Type == AIn_MC12bADC && 
-                       pBoardConfigAInChannels->Data[i].Config.MC12b.ChannelType == 1) {
-                activeType1ChannelCount++;
+                isPublic = pBoardConfigAInChannels->Data[i].Config.AD7609.IsPublic;
+                if (isPublic) {
+                    hasActiveAD7609Channels = true;
+                    totalEnabledPublicChannels++;
+                }
+            } else if (pBoardConfigAInChannels->Data[i].Type == AIn_MC12bADC) {
+                isPublic = pBoardConfigAInChannels->Data[i].Config.MC12b.IsPublic;
+                if (isPublic) {
+                    totalEnabledPublicChannels++;
+                    if (pBoardConfigAInChannels->Data[i].Config.MC12b.ChannelType == 1) {
+                        activeType1ChannelCount++;
+                    }
+                }
             }
         }
     }
-    
-    // Note: Internal monitoring channels are configured with fixed 1Hz in NQ3 runtime config
-    /**
-     * The maximum aggregate trigger frequency for all active Type 1 ADC channels is 15,000 Hz.
-     * For example, if two Type 1 channels are active, each can trigger at a maximum frequency of 7,500 Hz (15,000 / 2).
-     * 
-     * The maximum triggering frequency of non type 1 channel is 1000 hz, 
-     * which is obtained by dividing Frequency with ChannelScanFreqDiv. 
-     * Non-Type 1 channels are setup for channel scanning
-     * 
-     */
-    if (activeType1ChannelCount > 0 && (freq * activeType1ChannelCount) > 15000) {
-        freq = 15000 / activeType1ChannelCount;
+
+    // Three-constraint frequency capping (see streaming.h)
+    {
+        uint32_t maxFreq = Streaming_ComputeMaxFreq(
+            activeType1ChannelCount, totalEnabledPublicChannels);
+        if (freq > maxFreq) {
+            LOG_I("Frequency capped: %u Hz -> %u Hz (%u ch, %u type1)",
+                  (unsigned)freq, (unsigned)maxFreq,
+                  (unsigned)totalEnabledPublicChannels,
+                  (unsigned)activeType1ChannelCount);
+            freq = maxFreq;
+        }
     }
 
     // CRITICAL: Always call ADC_WriteChannelStateAll() to enable/disable channel interrupts

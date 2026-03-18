@@ -57,7 +57,8 @@ static StreamingStats gStreamStats = {0};
 
 // Log-once flags: each error condition logs once per session to avoid flooding
 // the 64-message circular log buffer. All reset in Streaming_ClearStats().
-static bool gLoggedQueueDrop = false;
+static bool gLoggedPoolExhaust = false;
+static bool gLoggedQueueOverflow = false;
 static bool gLoggedUsbDrop = false;
 static bool gLoggedWifiDrop = false;
 static bool gLoggedSdDrop = false;
@@ -231,7 +232,18 @@ void _Streaming_Deferred_Interrupt_Task(void) {
             // No heap check needed - pool uses pre-allocated static memory
             pPublicSampleList = AInSampleList_AllocateFromPool();
             if(pPublicSampleList==NULL) {
-                LOG_E("Streaming: Sample pool exhausted\r\n");
+                gStreamStats.queueDroppedSamples++;
+                if (!gLoggedPoolExhaust) {
+                    gLoggedPoolExhaust = true;
+                    LOG_E("Streaming: Sample pool exhausted");
+                }
+                Streaming_UpdateFlowWindow(true);
+                // Still increment test pattern counter to stay in sync
+                if (gTestPattern != 0) {
+                    taskENTER_CRITICAL();
+                    gTestPatternSampleCount++;
+                    taskEXIT_CRITICAL();
+                }
                 continue;
             }
             for (i = 0; i < pAiRunTimeChannelConfig->Size; i++) {
@@ -273,8 +285,8 @@ void _Streaming_Deferred_Interrupt_Task(void) {
             }
             if(!AInSampleList_PushBack(pPublicSampleList)){//failed pushing to Q
                 gStreamStats.queueDroppedSamples++;
-                if (!gLoggedQueueDrop) {
-                    gLoggedQueueDrop = true;
+                if (!gLoggedQueueOverflow) {
+                    gLoggedQueueOverflow = true;
                     LOG_E("Streaming: Sample queue overflow detected");
                 }
                 AInSampleList_FreeToPool(pPublicSampleList);  // Use pool!
@@ -446,7 +458,8 @@ void Streaming_GetStats(StreamingStats* out) {
 
 void Streaming_ClearStats(void) {
     memset((void*)&gStreamStats, 0, sizeof(gStreamStats));
-    gLoggedQueueDrop = false;
+    gLoggedPoolExhaust = false;
+    gLoggedQueueOverflow = false;
     gLoggedUsbDrop = false;
     gLoggedWifiDrop = false;
     gLoggedSdDrop = false;
@@ -826,6 +839,32 @@ void streaming_Task(void) {
                     }
                 }
 
+            }
+
+            // Track packets discarded due to output buffer backpressure.
+            // The streaming task always encodes to drain the sample queue
+            // (preventing queueDroppedSamples), but when an output buffer
+            // is too full (< 128 bytes free), the encoded packet is silently
+            // discarded. Count these drops so SYST:STR:STATS? is accurate.
+            {
+                bool sdExpected = hasSD || (
+                    pRunTimeStreamConf->ActiveInterface == StreamingInterface_SD ||
+                    pRunTimeStreamConf->ActiveInterface == StreamingInterface_All ||
+                    (pSDCardSettings && pSDCardSettings->enable &&
+                     pSDCardSettings->mode == SD_CARD_MANAGER_MODE_WRITE &&
+                     pRunTimeStreamConf->ActiveInterface != StreamingInterface_WiFi));
+                bool sdWritten = hasSD && gSdFileWasReady;
+
+                if (sdExpected && !sdWritten) {
+                    gStreamStats.sdDroppedBytes += packetSize;
+                    taskENTER_CRITICAL();
+                    gQuesBits |= QUES_BIT_SD_OVERFLOW;
+                    taskEXIT_CRITICAL();
+                    if (!gLoggedSdDrop) {
+                        gLoggedSdDrop = true;
+                        LOG_E("Streaming: SD output skipped (buffer full or file not ready)");
+                    }
+                }
             }
         }
         DIO_TIMING_TEST_WRITE_STATE(0);
