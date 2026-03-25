@@ -51,6 +51,18 @@ typedef struct s_tcpClientContext
     scpi_t scpiContext;
     
     bool tcpSendPending;
+
+    /** Bytes handed to radio send() successfully (64-bit for long sessions) */
+    uint64_t wifiTcpBytesSent;
+    /** Bytes confirmed by radio send callback (64-bit for long sessions) */
+    uint64_t wifiTcpBytesConfirmed;
+    /** Radio send errors (negative sentBytes in callback — real failures) */
+    uint32_t wifiTcpSendErrors;
+    /** Partial sends (callback confirmed fewer bytes than requested — normal TCP segmentation) */
+    uint32_t wifiTcpPartialSends;
+    /** Pending send size (to compare against callback confirmation).
+     *  Written by streaming task (TcpServerFlush), read by WiFi task (callback). */
+    volatile uint16_t lastSendSize;
 } wifi_tcp_server_clientContext_t;
 
 /**

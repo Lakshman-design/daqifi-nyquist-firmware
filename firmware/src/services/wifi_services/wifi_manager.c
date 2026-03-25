@@ -326,7 +326,40 @@ static void SocketEventCallback(SOCKET socket, uint8_t messageType, void *pMessa
         }
         case SOCKET_MSG_SEND:
         {
-            gStateMachineContext.pTcpServerContext->client.tcpSendPending=0;
+            if (gStateMachineContext.pTcpServerContext != NULL && pMessage != NULL) {
+                int16_t sentBytes = *(int16_t*)pMessage;
+                wifi_tcp_server_clientContext_t* client = &gStateMachineContext.pTcpServerContext->client;
+                client->tcpSendPending = 0;
+
+                // Single critical section for all counter updates + lastSendSize read
+                uint16_t sendSize;
+                uint32_t errorCount, partialCount;
+                bool isPartial = false;
+                bool isError = false;
+
+                taskENTER_CRITICAL();
+                sendSize = client->lastSendSize;
+                if (sentBytes >= 0) {
+                    client->wifiTcpBytesConfirmed += (uint16_t)sentBytes;
+                    if (sendSize > 0 && (uint16_t)sentBytes < sendSize) {
+                        client->wifiTcpPartialSends++;
+                        isPartial = true;
+                    }
+                } else {
+                    client->wifiTcpSendErrors++;
+                    isError = true;
+                }
+                errorCount = client->wifiTcpSendErrors;
+                partialCount = client->wifiTcpPartialSends;
+                taskEXIT_CRITICAL();
+
+                // Log outside critical section using snapshotted counts
+                if (isPartial && partialCount == 1) {
+                    LOG_I("WiFi TCP partial send: %d/%u bytes (normal segmentation)", (int)sentBytes, (unsigned)sendSize);
+                } else if (isError && errorCount == 1) {
+                    LOG_E("WiFi TCP send error: %d", (int)sentBytes);
+                }
+            }
         }
             break;
         default:
