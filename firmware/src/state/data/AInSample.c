@@ -2,13 +2,18 @@
  * @brief Analog input sample queue and object pool implementation.
  *
  * Implements a FreeRTOS queue for streaming analog input samples between the
- * ADC interrupt handler and the streaming task. Uses a pre-allocated object pool
- * with O(1) free list allocation to eliminate heap overhead at high sample rates.
+ * ADC interrupt handler and the streaming task. Uses a dynamically allocated
+ * object pool with O(1) free list allocation to eliminate heap overhead at
+ * high sample rates.
+ *
+ * The pool is allocated from the FreeRTOS heap at AInSampleList_Initialize()
+ * and freed at AInSampleList_Destroy(). Pool size is configurable via the
+ * maxSize parameter (clamped to MIN/MAX_AIN_SAMPLE_COUNT).
  *
  * Performance characteristics:
  * - Queue: Standard FreeRTOS queue (thread-safe, ISR-safe)
  * - Pool allocation: O(1) via free list (no fragmentation, deterministic timing)
- * - Pool size: MAX_AIN_SAMPLE_COUNT (700) samples for high-speed streaming
+ * - Pool size: Configurable (default DEFAULT_AIN_SAMPLE_COUNT = 700)
  *
  * @author Javier Longares Abaiz - When Technology becomes art.
  * @web www.javierlongares.com
@@ -18,6 +23,7 @@
 #include "FreeRTOS.h"
 #include "queue.h"
 #include <string.h>  // For memset
+#include "Util/Logger.h"
 
 //! Ticks to wait for QUEUE OPERATIONS
 #define AINSAMPLE_QUEUE_TICKS_TO_WAIT               0  // No delay
@@ -28,58 +34,102 @@ static QueueHandle_t analogInputsQueue;
 static uint32_t queueSize = 0;
 
 // =============================================================================
-// Object Pool Configuration
+// Object Pool (dynamically allocated from FreeRTOS heap)
 // =============================================================================
-// Pool size uses MAX_AIN_SAMPLE_COUNT directly to ensure consistency.
-// This eliminates heap allocation/deallocation overhead during streaming.
-static AInPublicSampleList_t samplePool[MAX_AIN_SAMPLE_COUNT];
+static AInPublicSampleList_t* samplePool = NULL;
+static uint32_t poolCapacity = 0;
 
 // =============================================================================
 // Free List Data Structures (O(1) allocation/deallocation)
 // =============================================================================
-// The free list is a singly-linked list embedded in the nextFree array.
-// Each free slot contains the index of the next free slot, forming a chain.
-// Allocation pops from head, deallocation pushes to head - both O(1).
-//
-// Example state with slots 0,2,5 free:
-//   freeHead = 0
-//   nextFree[0] = 2, nextFree[2] = 5, nextFree[5] = -1 (end)
-//   Chain: 0 -> 2 -> 5 -> END
-static int16_t freeHead = -1;              // Index of first free slot (-1 = empty)
-static int16_t nextFree[MAX_AIN_SAMPLE_COUNT]; // Each slot points to next free slot
+static int16_t freeHead = -1;
+static int16_t* nextFree = NULL;
 
 static SemaphoreHandle_t poolMutex = NULL;
-static volatile bool poolActive = false;  // Guards against teardown races
-
-// Compile-time assertion to ensure pool size matches expected queue size
-_Static_assert(MAX_AIN_SAMPLE_COUNT >= 20, "Pool must be at least 20 for queue");
+static volatile bool poolActive = false;
 
 void AInSampleList_Initialize(
                             size_t maxSize,
                             bool dropOnOverflow,
                             const LockProvider* lockPrototype){
 
-
     (void)dropOnOverflow;
     (void)lockPrototype;
 
-    // Enforce invariant: queue size cannot exceed pool capacity
-    configASSERT(maxSize <= MAX_AIN_SAMPLE_COUNT);
+    // Destroy previous resources if re-initializing (any size change or same size).
+    // Must destroy before creating new queue to prevent orphaning the old handle.
+    if (samplePool != NULL) {
+        AInSampleList_Destroy();
+    }
+
+    // Clamp pool size to compile-time limits
+    if (maxSize < MIN_AIN_SAMPLE_COUNT) maxSize = MIN_AIN_SAMPLE_COUNT;
+    if (maxSize > MAX_AIN_SAMPLE_COUNT) maxSize = MAX_AIN_SAMPLE_COUNT;
+
+    // Clamp further to what the heap can actually fit.
+    // Check BEFORE allocating anything so we don't waste heap on an
+    // oversized queue that we'd have to delete and recreate.
+    if (samplePool == NULL) {
+        size_t perSample = sizeof(AInPublicSampleList_t) + sizeof(int16_t);
+        size_t heapAvail = xPortGetFreeHeapSize();
+        // Reserve 10KB for queue + FreeRTOS overhead + alignment padding
+        size_t usable = (heapAvail > 10240) ? (heapAvail - 10240) : 0;
+        uint32_t maxFit = (uint32_t)(usable / perSample);
+
+        if (maxSize > maxFit) {
+            maxSize = (maxFit >= MIN_AIN_SAMPLE_COUNT) ? maxFit : MIN_AIN_SAMPLE_COUNT;
+        }
+    }
 
     queueSize = maxSize;
     analogInputsQueue = xQueueCreate(queueSize, sizeof(AInPublicSampleList_t *));
     configASSERT(analogInputsQueue != NULL);
 
-    // Initialize object pool
+    // Allocate pool from heap.
+    // Total heap cost: maxSize * (sizeof(AInPublicSampleList_t) + sizeof(int16_t))
+    //                = maxSize * (208 + 2) = maxSize * 210 bytes
+    if (samplePool == NULL) {
+        poolCapacity = maxSize;
+
+        samplePool = (AInPublicSampleList_t*)pvPortMalloc(
+            poolCapacity * sizeof(AInPublicSampleList_t));
+        if (samplePool == NULL) {
+            LOG_E("Sample pool alloc failed (%u samples, %u bytes)",
+                  (unsigned)poolCapacity,
+                  (unsigned)(poolCapacity * sizeof(AInPublicSampleList_t)));
+            vQueueDelete(analogInputsQueue);
+            analogInputsQueue = NULL;
+            queueSize = 0;
+            poolCapacity = 0;
+            configASSERT(0);
+            return;
+        }
+
+        nextFree = (int16_t*)pvPortMalloc(poolCapacity * sizeof(int16_t));
+        if (nextFree == NULL) {
+            vPortFree(samplePool);
+            samplePool = NULL;
+            vQueueDelete(analogInputsQueue);
+            analogInputsQueue = NULL;
+            queueSize = 0;
+            poolCapacity = 0;
+            LOG_E("Sample pool nextFree alloc failed");
+            configASSERT(0);
+            return;
+        }
+    }
+
+    // Initialize object pool mutex
     if (poolMutex == NULL) {
         poolMutex = xSemaphoreCreateMutex();
+        configASSERT(poolMutex != NULL);
     }
 
     // Build free list chain: 0 → 1 → 2 → ... → N-1 → -1
-    for (int i = 0; i < MAX_AIN_SAMPLE_COUNT - 1; i++) {
-        nextFree[i] = i + 1;
+    for (uint32_t i = 0; i < poolCapacity - 1; i++) {
+        nextFree[i] = (int16_t)(i + 1);
     }
-    nextFree[MAX_AIN_SAMPLE_COUNT - 1] = -1;  // End of list
+    nextFree[poolCapacity - 1] = -1;  // End of list
     freeHead = 0;  // Start at first entry
 
     poolActive = true;
@@ -88,16 +138,24 @@ void AInSampleList_Initialize(
 /**
  * @brief Destroys the sample queue and resets the object pool.
  *
- * Teardown sequence (order matters for thread safety):
- * 1. Block new pool operations (poolActive = false)
+ * Thread safety note: We do NOT take poolMutex at the top of this function.
+ * Instead, we use poolActive (32-bit atomic write on PIC32MZ) as a fast-path
+ * guard that immediately blocks new AllocateFromPool/FreeToPool calls without
+ * mutex contention. The mutex is only taken later (step 5) as a synchronization
+ * barrier to ensure in-flight operations complete before freeing memory.
+ * This is safe because Destroy is only called from Streaming_Start (task context,
+ * streaming stopped) when no ISR or task is allocating from the pool.
+ *
+ * Teardown sequence (order matters):
+ * 1. Block new pool operations (poolActive = false — atomic on PIC32MZ)
  * 2. Atomically capture and nullify queue handle
- * 3. Drain remaining samples back to pool
- * 4. Delete FreeRTOS resources
- * 5. Reset pool to initial state
+ * 3. Drain remaining samples
+ * 4. Delete FreeRTOS queue
+ * 5. Take mutex as barrier, free pool memory
  */
 void AInSampleList_Destroy()
 {
-    // Step 1: Block new pool operations first
+    // Step 1: Block new pool operations (atomic 32-bit write, no mutex needed)
     poolActive = false;
 
     // Step 2: Atomically capture and nullify queue handle to prevent further use
@@ -107,34 +165,35 @@ void AInSampleList_Destroy()
     taskEXIT_CRITICAL();
 
     // Step 3 & 4: Drain queue and delete (using captured handle)
-    // Drain until xQueueReceive fails - more robust than checking message count
     if (q != NULL) {
         AInPublicSampleList_t* pData;
         while (xQueueReceive(q, &pData, 0) == pdTRUE) {
-            if (pData != NULL) {
-                AInSampleList_FreeToPool(pData);
-            }
+            // Just drain — we're about to free the whole pool
         }
         vQueueDelete(q);
     }
 
-    // Step 5: Reset pool to initial state with proper synchronization
-    // Use poolMutex (not critical section) to ensure all in-flight Allocate/Free
-    // operations complete before resetting the free list. This prevents corruption
-    // if a task allocated a sample before poolActive was set to false.
-    //
-    // NOTE: We intentionally do NOT delete poolMutex here to prevent UAF.
-    // The mutex persists for system lifetime (~80 bytes).
+    // Step 5: Free pool memory with proper synchronization.
+    // Take mutex as barrier if available; free unconditionally either way
+    // to prevent heap leaks if mutex creation failed during init.
     if (poolMutex != NULL) {
-        xSemaphoreTake(poolMutex, portMAX_DELAY);  // Synchronization barrier
-        // Rebuild free list chain: 0 -> 1 -> 2 -> ... -> N-1 -> END
-        for (int i = 0; i < MAX_AIN_SAMPLE_COUNT - 1; i++) {
-            nextFree[i] = i + 1;
-        }
-        nextFree[MAX_AIN_SAMPLE_COUNT - 1] = -1;
-        freeHead = 0;
+        xSemaphoreTake(poolMutex, portMAX_DELAY);
+    }
+    if (samplePool != NULL) {
+        vPortFree(samplePool);
+        samplePool = NULL;
+    }
+    if (nextFree != NULL) {
+        vPortFree(nextFree);
+        nextFree = NULL;
+    }
+    poolCapacity = 0;
+    freeHead = -1;
+    if (poolMutex != NULL) {
         xSemaphoreGive(poolMutex);
     }
+
+    queueSize = 0;
 }
 
 bool AInSampleList_PushBack(const AInPublicSampleList_t* pData){
@@ -248,7 +307,7 @@ bool AInSampleList_IsEmpty()
 
 
 // ============================================================================
-// Object Pool Implementation (replaces heap allocation/deallocation)
+// Object Pool Implementation (dynamically allocated from heap)
 // ============================================================================
 
 AInPublicSampleList_t* AInSampleList_AllocateFromPool() {
@@ -260,7 +319,7 @@ AInPublicSampleList_t* AInSampleList_AllocateFromPool() {
     xSemaphoreTake(poolMutex, portMAX_DELAY);
 
     // O(1) allocation: pop from free list head
-    if (freeHead >= 0) {
+    if (freeHead >= 0 && samplePool != NULL) {
         int idx = freeHead;
         freeHead = nextFree[idx];  // Move head to next free
         result = &samplePool[idx];
@@ -274,13 +333,13 @@ AInPublicSampleList_t* AInSampleList_AllocateFromPool() {
 }
 
 void AInSampleList_FreeToPool(AInPublicSampleList_t* pSample) {
-    if (pSample == NULL || !poolActive || poolMutex == NULL) {
+    if (pSample == NULL || !poolActive || poolMutex == NULL || samplePool == NULL) {
         return;
     }
 
     ptrdiff_t index = pSample - samplePool;
 
-    if (index < 0 || index >= MAX_AIN_SAMPLE_COUNT) {
+    if (index < 0 || (uint32_t)index >= poolCapacity) {
         return;  // Not from our pool
     }
 
@@ -289,4 +348,8 @@ void AInSampleList_FreeToPool(AInPublicSampleList_t* pSample) {
     nextFree[index] = freeHead;
     freeHead = (int16_t)index;
     xSemaphoreGive(poolMutex);
+}
+
+size_t AInSampleList_PoolCapacity(void) {
+    return poolCapacity;
 }

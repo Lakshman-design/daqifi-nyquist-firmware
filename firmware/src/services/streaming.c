@@ -30,6 +30,8 @@
 #include "../HAL/TimerApi/TimerApi.h"
 #include "HAL/ADC/MC12bADC.h"
 #include "sd_card_services/sd_card_manager.h"
+#include "wifi_services/wifi_tcp_server.h"
+#include "state/runtime/BoardRuntimeConfig.h"
 
 // --- Test pattern streaming mode ---
 // When non-zero, overrides ADC sample values with synthetic data patterns.
@@ -361,11 +363,38 @@ static void Streaming_TimerHandler(uintptr_t context, uint32_t alarmCount) {
  */
 static void Streaming_Start(void) {
     if (!gpRuntimeConfigStream->Running) {
-        // Clear any stale samples from previous streaming session to free heap
+        // Apply dynamic memory configuration if changed.
+        // SCPI validates bounds, but clamp here too for defense-in-depth.
+        if (gpRuntimeConfigStream->IsEnabled) {
+            MemoryConfig* mc = BoardRunTimeConfig_Get(BOARDRUNTIME_MEMORY_CONFIG);
+
+            // NOTE: USB and WiFi circular buffer resize is NOT done here.
+            // The USB/WiFi tasks run concurrently at high priority and may be
+            // actively reading from the circular buffer. Resizing here caused
+            // use-after-free crashes (USB Code 43 descriptor failure).
+            // Circular buffer resize must be done via SCPI commands while
+            // streaming is stopped (the streaming guard enforces this).
+            // Sample pool resize IS safe here because the deferred ISR task
+            // and streaming task are both stopped (Running == false).
+
+            // NOTE: Runtime pool resize is disabled in this PR.
+            // AInSampleList_Destroy + re-Initialize crashes the device due to
+            // an undiagnosed interaction between pool deallocation and the
+            // USB CDC data path. The pool is allocated once at boot (700 samples)
+            // and cannot be changed at runtime. SYST:MEM:SAMP:POOL sets the
+            // config value but it only takes effect on reboot (via BoardData_Init).
+            // TODO: Debug and fix in follow-up PR (issue #229).
+            if (mc->samplePoolCount > 0 && mc->samplePoolCount != AInSampleList_PoolCapacity()) {
+                LOG_I("Pool resize to %u deferred (runtime resize not yet supported)",
+                      (unsigned)mc->samplePoolCount);
+            }
+        }
+
+        // Clear any stale samples from previous streaming session
         AInPublicSampleList_t* pStale;
         while (AInSampleList_PopFront(&pStale)) {
             if (pStale != NULL) {
-                AInSampleList_FreeToPool(pStale);  // Use pool instead of vPortFree!
+                AInSampleList_FreeToPool(pStale);
             }
         }
 
