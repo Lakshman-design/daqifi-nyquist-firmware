@@ -1581,6 +1581,7 @@ static scpi_result_t SCPI_ClearStreamStats(scpi_t * context) {
     }
     // Reset SD write metrics
     sd_card_manager_ResetWriteMetrics();
+    AInSampleList_PoolResetMaxUsed();
     SCPI_SyncQuesBits();
     return SCPI_RES_OK;
 }
@@ -2422,6 +2423,10 @@ static scpi_result_t SCPI_GetMemFree(scpi_t * context) {
                 (unsigned)(samplePoolCap * sizeof(int16_t)));
     scpi_printf(context, "SampleQueueBytes=%u\r\n",
                 (unsigned)(samplePoolCap * sizeof(void*) + 80));
+    scpi_printf(context, "SamplePoolInUse=%u\r\n",
+                (unsigned)AInSampleList_PoolInUse());
+    scpi_printf(context, "SamplePoolMaxUsed=%u\r\n",
+                (unsigned)AInSampleList_PoolMaxUsed());
     return SCPI_RES_OK;
 }
 
@@ -2481,6 +2486,40 @@ static scpi_result_t SCPI_MemAutoBalance(scpi_t * context) {
     scpi_printf(context, "WiFi=%u\r\n", (unsigned)mc->wifiCircularBufSize);
     scpi_printf(context, "USB=%u\r\n", (unsigned)mc->usbCircularBufSize);
     scpi_printf(context, "Pool=%u\r\n", (unsigned)mc->samplePoolCount);
+    return SCPI_RES_OK;
+}
+
+// =============================================================================
+// Stack Profiling SCPI Callback
+// =============================================================================
+
+static scpi_result_t SCPI_GetStackStats(scpi_t * context) {
+    // uxTaskGetSystemState requires configUSE_TRACE_FACILITY = 1
+    UBaseType_t taskCount = uxTaskGetNumberOfTasks();
+    TaskStatus_t* taskStatusArray = (TaskStatus_t*)pvPortMalloc((taskCount + 2) * sizeof(TaskStatus_t));
+    if (taskStatusArray == NULL) {
+        LOG_E("SYST:MEM:STACk? malloc failed for %u tasks", (unsigned)taskCount);
+        SCPI_ErrorPush(context, SCPI_ERROR_SYSTEM_ERROR);
+        return SCPI_RES_ERR;
+    }
+
+    UBaseType_t actualCount = uxTaskGetSystemState(taskStatusArray, taskCount, NULL);
+
+    for (UBaseType_t i = 0; i < actualCount; i++) {
+        // usStackHighWaterMark = minimum free stack WORDS ever (on PIC32MZ, 1 word = 4 bytes)
+        UBaseType_t hwm = taskStatusArray[i].usStackHighWaterMark;
+
+        scpi_printf(context, "%s: prio=%u, hwm=%u words (%u bytes free)\r\n",
+                    taskStatusArray[i].pcTaskName,
+                    (unsigned)taskStatusArray[i].uxCurrentPriority,
+                    (unsigned)hwm,
+                    (unsigned)(hwm * sizeof(StackType_t)));
+    }
+
+    // Also report ISR stack (not tracked by FreeRTOS — would need manual measurement)
+    scpi_printf(context, "ISR_Stack: configured=8192 bytes (not profiled)\r\n");
+
+    vPortFree(taskStatusArray);
     return SCPI_RES_OK;
 }
 
@@ -2686,6 +2725,7 @@ static const scpi_command_t scpi_commands[] = {
     {.pattern = "SYSTem:MEMory:SAMPle:POOL?", .callback = SCPI_GetMemSamplePool,},
     {.pattern = "SYSTem:MEMory:FREE?", .callback = SCPI_GetMemFree,},
     {.pattern = "SYSTem:MEMory:AUTO", .callback = SCPI_MemAutoBalance,},
+    {.pattern = "SYSTem:MEMory:STACk?", .callback = SCPI_GetStackStats,},
     //
     {.pattern = "SYSTem:STORage:SD:LOGging", .callback = SCPI_StorageSDLoggingSet,},
     {.pattern = "SYSTem:STORage:SD:GET", .callback = SCPI_StorageSDGetData},

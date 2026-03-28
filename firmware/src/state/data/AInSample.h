@@ -59,11 +59,14 @@ extern "C" {
      * Default sample pool depth.
      * Used when no runtime override is configured (MemoryConfig.samplePoolCount = 0).
      *
-     * Memory impact: ~208 bytes per sample (16ch × 12 bytes + 16 bools + overhead)
-     *   700 samples = ~146 KB
-     *   1200 samples = ~250 KB
+     * Memory impact: ~210 bytes per sample (208 data + 2 nextFree)
+     *   700 samples = ~147 KB
+     *   1100 samples = ~231 KB (current default after stack right-sizing)
+     *
+     * Sized to use available heap after right-sized task stacks (#230),
+     * leaving ~27KB headroom for WiFi driver + transient allocations.
      */
-#define DEFAULT_AIN_SAMPLE_COUNT 700
+#define DEFAULT_AIN_SAMPLE_COUNT 1100
 #define MIN_AIN_SAMPLE_COUNT     100
 #define MAX_AIN_SAMPLE_COUNT     2000
     ARRAYWRAPPERDEF(AInSampleArray, AInSample, MAX_AIN_CHANNEL);
@@ -175,6 +178,21 @@ extern "C" {
      * @brief Returns the current pool capacity (number of samples).
      */
     size_t AInSampleList_PoolCapacity(void);
+
+    /**
+     * @brief Returns the number of samples currently allocated (in use).
+     */
+    uint32_t AInSampleList_PoolInUse(void);
+
+    /**
+     * @brief Returns the peak pool usage (max samples ever simultaneously in use).
+     */
+    uint32_t AInSampleList_PoolMaxUsed(void);
+
+    /**
+     * @brief Resets the peak usage counter to current usage.
+     */
+    void AInSampleList_PoolResetMaxUsed(void);
 
 #ifdef __cplusplus
 }

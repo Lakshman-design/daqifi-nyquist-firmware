@@ -499,6 +499,8 @@ void Streaming_ClearStats(void) {
     memset(gFlowWindow, 0, sizeof(gFlowWindow));
     gFlowWindowCount = 0;
     gQuesBits = 0;  // 32-bit write is atomic on PIC32MZ
+    // NOTE: Pool max-used is NOT reset here — it persists across sessions
+    // so users can check peak usage after stopping. Reset via SYST:STR:ClearStats.
 }
 
 /**
@@ -905,20 +907,23 @@ void TimestampTimer_Init(void) {
     //     This is a free running timer used for reference -
     //     this doesn't interrupt or callback
 
+    // Stack sizes profiled under stress. See issue #230.
     if (gStreamingTaskHandle == NULL) {
         BaseType_t result = xTaskCreate((TaskFunction_t) streaming_Task,
                 "Stream task",
-                4096, NULL, 2, &gStreamingTaskHandle);
+                1392, NULL, 2, &gStreamingTaskHandle);  // Profiled: 692 words peak. 2x margin. (was 4096)
         if (result != pdPASS) {
-            LOG_E("FATAL: Failed to create streaming_Task (4096 bytes)\r\n");
+            LOG_E("FATAL: Failed to create streaming_Task\r\n");
+            while(1);
         }
     }
     if (gStreamingInterruptHandle == NULL) {
         BaseType_t result = xTaskCreate((TaskFunction_t) _Streaming_Deferred_Interrupt_Task,
                 "Stream Interrupt",
-                4096, NULL, 8, &gStreamingInterruptHandle);
+                512, NULL, 8, &gStreamingInterruptHandle);  // Profiled: 214 words peak + FPU. 2x margin. (was 4096)
         if (result != pdPASS) {
-            LOG_E("FATAL: Failed to create _Streaming_Deferred_Interrupt_Task (4096 bytes)\r\n");
+            LOG_E("FATAL: Failed to create _Streaming_Deferred_Interrupt_Task\r\n");
+            while(1);
         }
     }
     
