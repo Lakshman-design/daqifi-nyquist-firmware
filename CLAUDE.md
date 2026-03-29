@@ -359,7 +359,66 @@ SYSTem:STReam:TESTpattern?            # Query current pattern (0=disabled)
 - Sample counter resets at each `StartStreamData` for deterministic sessions
 - Works with all encoding formats (CSV/JSON/ProtoBuf) and output interfaces (USB/WiFi/SD)
 
-**Implementation:** `firmware/src/services/streaming.c` (gTestPattern, Streaming_GenerateTestValue)
+#### Streaming Throughput Benchmarking
+
+Two benchmark tools for measuring streaming pipeline throughput:
+
+**1. Benchmark Mode** (`SYST:STR:BENCHmark`): Bypasses the frequency cap so the timer ISR fires at any requested rate. Uses the real ISR→deferred task→encoder→output pipeline. Combine with test patterns for pure throughput measurement.
+
+```bash
+SYSTem:STReam:BENCHmark <0|1>     # 0=normal (freq cap active), 1=uncapped
+SYSTem:STReam:BENCHmark?           # Query current mode
+```
+
+Usage:
+```bash
+SYST:STR:TESTpattern 2             # Midscale test data
+SYST:STR:BENCHmark 1               # Uncap frequency
+SYST:StartStreamData 11000         # Start at 11kHz (normally capped)
+# ... wait ...
+SYST:StopStreamData
+SYST:STR:STATS?                    # Check throughput and drops
+SYST:STR:BENCHmark 0               # Restore normal mode
+```
+
+When enabled, the deferred ISR task priority is lowered from 8 to 2 for fair scheduling with the encoder. Priority is saved and restored on disable.
+
+**2. Self-Contained Throughput Test** (`SYST:STR:THRoughput`): Runs a complete benchmark internally — enables benchmark mode + test pattern, streams for the specified duration, stops, and returns all stats in one response.
+
+```bash
+SYSTem:STReam:THRoughput <freq>,<duration_sec>   # Run benchmark
+```
+
+Example: `SYST:STR:THR 5000,10` streams at 5kHz for 10 seconds.
+
+**Note:** This command blocks the USB SCPI task for the duration. Use the Python test suite (`test_throughput_benchmark.py`) for reliable automated benchmarking.
+
+**3. SD Write Benchmark** (pre-existing): Measures raw SD card write speed independent of streaming.
+
+```bash
+SYSTem:STORage:SD:BENCHmark <size_kb>,<pattern>  # Run (e.g., 1024,0)
+SYSTem:STORage:SD:BENCHmark?                      # Query results: bytes,ms,bps
+```
+
+**Measured Throughput Ceilings (NQ1, test patterns):**
+
+| Interface | Format | Channels | Max Zero-Loss Rate | KB/s |
+|-----------|--------|----------|------------------:|-----:|
+| USB | CSV | 1 | 13 kHz | 210 |
+| USB | CSV | 16 | 3 kHz | 766 |
+| USB | PB | 1 | 5 kHz | 62 |
+| USB | PB | 16 | 3 kHz | 136 |
+| SD | CSV | 1 | 5 kHz | 84 |
+| SD | CSV | 16 | 1 kHz | 272 |
+| SD | PB | 1 | 5 kHz | 61 |
+| SD | PB | 16 | 1 kHz | 46 |
+| WiFi | PB | 16 | 1 kHz | 49 |
+| WiFi | CSV | 16 | 1 kHz | 206 |
+| SD | raw write | — | — | 665 |
+
+Update this table when new benchmark results are collected. Full benchmark history is version-controlled in `daqifi-python-test-suite/benchmarks/` (CSV files + CHANGELOG.md). Run `python test_throughput_benchmark.py <port> <duration>` and copy the output CSV to that directory.
+
+**Implementation:** `firmware/src/services/streaming.c` (benchmark mode, gTestPattern, Streaming_GenerateTestValue), `firmware/src/services/SCPI/SCPIInterface.c` (SCPI callbacks)
 
 ### Board Variants
 
@@ -961,7 +1020,26 @@ The project can be built using Microchip tools in WSL/Linux:
    # If Windows shows Code 43: reprogram device via IPE
    ```
 
-2. **Power State Required**: Always power up the device before attempting WiFi or DAC operations
+2. **Always use Python test suite for automated/streaming tests**
+
+   Shell scripts with `dd | strings | grep` or picocom pipes are unreliable for:
+   - Binary ProtoBuf data (corrupts text parsing)
+   - Stats queries after streaming (stale data in serial buffer)
+   - Multi-step test sequences (timing-dependent)
+   - Throughput benchmarking (need precise timing)
+
+   Use `daqifi-python-test-suite` and `daqifi-python-core`:
+   ```bash
+   cd /tmp
+   git clone https://github.com/daqifi/daqifi-python-core.git
+   git clone https://github.com/daqifi/daqifi-python-test-suite.git
+   pip install --break-system-packages -e ./daqifi-python-core
+   ```
+
+   For new SCPI commands not yet in python-core, use `device._comm.send_command()`.
+   Add new test scripts to the test suite when building new features.
+
+3. **Power State Required**: Always power up the device before attempting WiFi or DAC operations
    ```bash
    # Check power state (0=STANDBY, 1=POWERED_UP, 2=POWERED_UP_EXT_DOWN)
    (echo -e "SYST:POW:STAT?\r"; sleep 0.5) | picocom -b 115200 -q -x 1000 /dev/ttyACM0 | tail -5

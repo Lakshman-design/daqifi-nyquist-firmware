@@ -40,6 +40,17 @@
 static volatile uint32_t gTestPattern = 0;       // 0=off, 1-4=pattern type
 static uint64_t gTestPatternSampleCount = 0;      // Monotonic counter, reset on start
 
+// Benchmark mode: bypasses frequency cap for throughput testing.
+// Uses uint32_t for guaranteed 32-bit atomic access on PIC32MZ.
+static volatile uint32_t gBenchmarkMode = 0;
+
+// Task priority constants
+#define STREAMING_ISR_TASK_PRIORITY     8
+#define STREAMING_BENCHMARK_PRIORITY    2
+
+// Saved ISR task priority for restore after benchmark
+static UBaseType_t gSavedIsrPriority = STREAMING_ISR_TASK_PRIORITY;
+
 // SD protobuf metadata: emitted as first message in each SD log file.
 // volatile: written by SD card task (via Streaming_ResetSdPbMetadata),
 // read by streaming task — compiler must not cache in registers.
@@ -131,7 +142,10 @@ static const NanopbFlagsArray fields_sd_metadata = {
 #define max(x,y) ((x) >= (y) ? (x) : (y))
 #endif // max
 
-#define BUFFER_SIZE min(min(USBCDC_WBUFFER_SIZE, WIFI_WBUFFER_SIZE), SD_CARD_MANAGER_CONF_WBUFFER_SIZE)  //2048
+// Encode buffer must fit the largest single encode output for any interface.
+// Previously used min() which limited all interfaces to the WiFi buffer size (1400).
+// Using max() allows each interface to use its full capacity when active.
+#define BUFFER_SIZE max(max(USBCDC_WBUFFER_SIZE, WIFI_WBUFFER_SIZE), SD_CARD_MANAGER_CONF_WBUFFER_SIZE)
 uint8_t buffer[BUFFER_SIZE];
 
 //! Pointer to the board configuration data structure to be set in 
@@ -743,15 +757,13 @@ void streaming_Task(void) {
         // This prevents queue backup which causes the deferred interrupt task to drop samples
         // If no outputs available, sample will be encoded then discarded (better than queue backup)
 
-        // Use maximum available space among all outputs for encoding (not just enabled ones)
-        // This ensures we can always encode even if all outputs are temporarily full
-        maxSize = 128;  // Minimum packet size
-        if (usbSize > maxSize) maxSize = usbSize;
-        if (wifiSize > maxSize) maxSize = wifiSize;
-        if (sdSize > maxSize) maxSize = sdSize;
-
-        // Cap at BUFFER_SIZE to prevent encoder overflow
-        if (maxSize > BUFFER_SIZE) maxSize = BUFFER_SIZE;
+        // Always encode at full buffer capacity. The encoder pops samples
+        // from the queue regardless of output space — this prevents queue
+        // backup and dropped samples. Encoded data is then written to
+        // whichever outputs have space, and discarded if none do.
+        // Previously used min(128, output_free) which caused CSV 16ch
+        // encoder failures when USB buffer was full (128 < row size ~172).
+        maxSize = BUFFER_SIZE;
 
         nanopbFlag.Size = 0;
 
@@ -944,3 +956,182 @@ void Streaming_SetTestPattern(uint32_t pattern) {
 uint32_t Streaming_GetTestPattern(void) {
     return gTestPattern;  // 32-bit read is atomic on PIC32MZ
 }
+
+void Streaming_SetBenchmarkMode(bool enabled) {
+    // Serialize transitions — prevents race if called from USB and WiFi SCPI
+    taskENTER_CRITICAL();
+    if (enabled && gBenchmarkMode == 0) {
+        if (gStreamingInterruptHandle != NULL) {
+            gSavedIsrPriority = uxTaskPriorityGet(gStreamingInterruptHandle);
+            vTaskPrioritySet(gStreamingInterruptHandle, STREAMING_BENCHMARK_PRIORITY);
+        }
+        gBenchmarkMode = 1;
+    } else if (!enabled && gBenchmarkMode != 0) {
+        gBenchmarkMode = 0;
+        if (gStreamingInterruptHandle != NULL) {
+            vTaskPrioritySet(gStreamingInterruptHandle, gSavedIsrPriority);
+        }
+    }
+    taskEXIT_CRITICAL();
+}
+
+bool Streaming_GetBenchmarkMode(void) {
+    return gBenchmarkMode != 0;
+}
+
+// Removed: Streaming_RunBenchmark — replaced by benchmark mode flag.
+// The deferred ISR task checks gBenchmarkMode and skips ulTaskNotifyTake
+// when enabled, generating samples as fast as the pipeline can consume them.
+// This uses the existing streaming infrastructure (stats, pool, encoder,
+// output buffers) without any special code paths.
+#if 0  // Reference: old standalone benchmark function
+    if (result == NULL || durationSec == 0 || durationSec > 60) return false;
+
+    StreamingRuntimeConfig* pStreamCfg = BoardRunTimeConfig_Get(
+            BOARDRUNTIME_STREAMING_CONFIGURATION);
+    if (pStreamCfg->Running || pStreamCfg->IsEnabled) {
+        LOG_E("Benchmark rejected: streaming is active");
+        return false;
+    }
+
+    tBoardData* pBoardData = BoardData_Get(BOARDDATA_ALL_DATA, 0);
+    tBoardConfig* pBoardConfig = BoardConfig_Get(BOARDCONFIG_ALL_CONFIG, 0);
+    AInRuntimeArray* pAiChannels = BoardRunTimeConfig_Get(BOARDRUNTIMECONFIG_AIN_CHANNELS);
+
+    memset(result, 0, sizeof(StreamingBenchmarkResult));
+
+    // Generate a fake sample with all enabled channels
+    AInPublicSampleList_t fakeSample;
+    memset(&fakeSample, 0, sizeof(fakeSample));
+    uint32_t sampleCounter = 0;
+
+    for (uint8_t i = 0; i < pAiChannels->Size; i++) {
+        if (pAiChannels->Data[i].IsEnabled &&
+            AInChannel_IsPublic(&pBoardConfig->AInChannels.Data[i])) {
+            fakeSample.sampleElement[i].Channel =
+                pBoardConfig->AInChannels.Data[i].DaqifiAdcChannelId;
+            fakeSample.sampleElement[i].Timestamp = 0;
+            fakeSample.sampleElement[i].Value = 2048;  // Midscale
+            fakeSample.isSampleValid[i] = true;
+        }
+    }
+
+    // Temporarily set encoding and interface for the benchmark
+    StreamingEncoding savedEncoding = pStreamCfg->Encoding;
+    StreamingInterface savedInterface = pStreamCfg->ActiveInterface;
+    pStreamCfg->Encoding = (StreamingEncoding)encoding;
+    pStreamCfg->ActiveInterface = (StreamingInterface)interface;
+
+    // Setup flags for encoder
+    NanopbFlagsArray nanopbFlag;
+    nanopbFlag.Size = 0;
+    nanopbFlag.Data[nanopbFlag.Size++] = DaqifiOutMessage_msg_time_stamp_tag;
+    nanopbFlag.Data[nanopbFlag.Size++] = DaqifiOutMessage_analog_in_data_tag;
+
+    // Init encoders (CSV/JSON need header state)
+    if (encoding == Streaming_Csv) {
+        csv_Init();
+    } else if (encoding == Streaming_Json) {
+        json_Init();
+    }
+
+    uint64_t totalBytes = 0;
+    uint32_t totalSamples = 0;
+    uint32_t outputDrops = 0;
+    uint32_t encFails = 0;
+
+    LOG_I("Benchmark: %us, interface=%u, encoding=%u",
+          (unsigned)durationSec, (unsigned)interface, (unsigned)encoding);
+
+    TickType_t startTick = xTaskGetTickCount();
+    TickType_t endTick = startTick + pdMS_TO_TICKS(durationSec * 1000);
+
+    // Tight loop: encode and output as fast as possible
+    while (xTaskGetTickCount() < endTick) {
+        // Update fake timestamp
+        fakeSample.sampleElement[0].Timestamp = xTaskGetTickCount();
+        sampleCounter++;
+
+        // Push fake sample to the queue (so encoder can pop it)
+        AInSampleList_PushBack(&fakeSample);
+
+        // Check output buffer space
+        size_t outSize = 0;
+        switch (interface) {
+            case 0: outSize = UsbCdc_WriteBuffFreeSize(NULL); break;
+            case 1: outSize = wifi_manager_GetWriteBuffFreeSize(); break;
+            case 2: outSize = sd_card_manager_IsWriteReady()
+                             ? sd_card_manager_GetWriteBuffFreeSize() : 0; break;
+        }
+
+        if (outSize < 128) {
+            // Output buffer full — yield to let it drain
+            AInPublicSampleList_t* pDiscard;
+            AInSampleList_PopFront(&pDiscard);  // Remove our sample
+            vTaskDelay(1);
+            continue;
+        }
+
+        // Encode
+        size_t maxEncode = (outSize > BUFFER_SIZE) ? BUFFER_SIZE : outSize;
+        size_t packetSize = 0;
+
+        if (encoding == Streaming_Csv) {
+            packetSize = csv_Encode(pBoardData, &nanopbFlag, (uint8_t*)buffer, maxEncode);
+        } else if (encoding == Streaming_Json) {
+            packetSize = Json_Encode(pBoardData, &nanopbFlag, (uint8_t*)buffer, maxEncode);
+        } else {
+            packetSize = Nanopb_Encode(pBoardData, &nanopbFlag, (uint8_t*)buffer, maxEncode);
+        }
+
+        if (packetSize == 0) {
+            encFails++;
+            // Still need to pop the sample we pushed
+            AInPublicSampleList_t* pDiscard;
+            AInSampleList_PopFront(&pDiscard);
+            continue;
+        }
+
+        totalBytes += packetSize;
+        totalSamples++;
+
+        // Write to output
+        size_t written = 0;
+        switch (interface) {
+            case 0: written = UsbCdc_WriteToBuffer(NULL, (const char*)buffer, packetSize); break;
+            case 1: written = wifi_tcp_server_WriteBuffer((const char*)buffer, packetSize); break;
+            case 2: written = sd_card_manager_WriteToBuffer((const char*)buffer, packetSize); break;
+        }
+
+        if (written < packetSize) {
+            outputDrops += (packetSize - written);
+        }
+
+        // Yield periodically to let output tasks drain
+        if ((sampleCounter % 100) == 0) {
+            vTaskDelay(1);
+        }
+    }
+
+    uint32_t elapsed = pdTICKS_TO_MS(xTaskGetTickCount() - startTick);
+
+    // Restore streaming config
+    pStreamCfg->Encoding = savedEncoding;
+    pStreamCfg->ActiveInterface = savedInterface;
+
+    // Fill result
+    result->durationMs = elapsed;
+    result->totalBytes = totalBytes;
+    result->totalSamples = totalSamples;
+    result->bytesPerSec = (elapsed > 0) ? (uint32_t)((totalBytes * 1000ULL) / elapsed) : 0;
+    result->samplesPerSec = (elapsed > 0) ? (totalSamples * 1000) / elapsed : 0;
+    result->outputDrops = outputDrops;
+    result->encoderFailures = encFails;
+
+    LOG_I("Benchmark done: %u bytes in %ums = %u bytes/sec, %u samples/sec",
+          (unsigned)totalBytes, (unsigned)elapsed,
+          (unsigned)result->bytesPerSec, (unsigned)result->samplesPerSec);
+
+    return true;
+}
+#endif  // Reference: old standalone benchmark function
