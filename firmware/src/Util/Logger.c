@@ -48,6 +48,12 @@
  * previous compile-time default). Written by SCPI task, read by all
  * tasks. Single-byte reads/writes are atomic on PIC32MZ.
  */
+/* One-shot suppression bitmask for LOG_x_ONCE macros.
+ * Written by ISR and task contexts (|= to set bits), cleared atomically
+ * by Logger_ResetOneShots() (single 32-bit write). */
+volatile uint32_t gLogOneShot = 0;
+volatile uint32_t gSessionOneShot = 0;
+
 volatile uint8_t gLogLevels[LOG_MODULE_COUNT] = {
     [LOG_MODULE_POWER]   = LOG_LEVEL_ERROR,
     [LOG_MODULE_WIFI]    = LOG_LEVEL_ERROR,
@@ -63,10 +69,9 @@ volatile uint8_t gLogLevels[LOG_MODULE_COUNT] = {
 
 /** Runtime ceilings per module — Logger_SetLevel() clamps to these.
  *  All modules allow full DEBUG via SCPI.
- *  WARNING: Do not call LOG_E/LOG_I/LOG_D from ISR context — LogIsInISR()
- *  detection fails when Harmony clears MIPS EXL/ERL (issue #191). The fix
- *  is a deferred logging task (also #191). Until then, ensure no log calls
- *  exist in true ISR handlers. */
+ *  LOG_E/LOG_I/LOG_D are ISR-aware — they detect ISR context via
+ *  uxInterruptNesting and route through a deferred queue (issue #191).
+ *  Format args are ignored in ISR context; use static strings. */
 static const uint8_t gLogCeilings[LOG_MODULE_COUNT] = {
     [LOG_MODULE_POWER]   = LOG_LEVEL_DEBUG,
     [LOG_MODULE_WIFI]    = LOG_LEVEL_DEBUG,
@@ -145,6 +150,14 @@ uint8_t Logger_GetCeiling(LogModule_t module) {
     return gLogCeilings[module];
 }
 
+void Logger_ResetOneShots(void) {
+    gLogOneShot = 0;  /* 32-bit write is atomic on PIC32MZ */
+}
+
+void Logger_ResetSessionOneShots(void) {
+    gSessionOneShot = 0;  /* 32-bit write is atomic on PIC32MZ */
+}
+
 LogBuffer logBuffer;
 
 #if defined(ENABLE_ICSP_REALTIME_LOG) && (ENABLE_ICSP_REALTIME_LOG == 1) && !defined(__DEBUG)
@@ -157,6 +170,15 @@ static inline bool LogIsInISR(void);
 /* ISR deferred queue — initialized in LogIsrInit(), used by LogMessage's
  * ISR-aware early path and the drain task. */
 static QueueHandle_t gIsrLogQueue = NULL;
+
+/* Count of ISR log messages dropped (queue full or not initialized).
+ * 32-bit increment from ISR is not atomic (RMW), but losing a count
+ * is acceptable — this is a diagnostic hint, not a precise counter. */
+static volatile uint32_t gIsrLogDropped = 0;
+
+uint32_t Logger_GetIsrDropCount(void) {
+    return gIsrLogDropped;  /* 32-bit read is atomic on PIC32MZ */
+}
 
 
 #if defined(ENABLE_ICSP_REALTIME_LOG) && (ENABLE_ICSP_REALTIME_LOG == 1) && !defined(__DEBUG)
@@ -312,21 +334,34 @@ int LogMessage(const char* format, ...)
 {
     if (format == NULL) return 0;
 
-    /* ISR path: minimal work — copy string, queue, return */
-    if (LogIsInISR() && gIsrLogQueue != NULL) {
-        LogEntry entry;
-        size_t len = strlen(format);
-        if (len == 0) return 0;
-        if (len > LOG_MESSAGE_SIZE - 3) len = LOG_MESSAGE_SIZE - 3;
-        memcpy(entry.message, format, len);
-        entry.message[len] = '\r';
-        entry.message[len + 1] = '\n';
-        entry.message[len + 2] = '\0';
+    /* ISR path: minimal work — copy string, queue, return.
+     * Must NOT fall through to the task path (vsnprintf + mutex). */
+    if (LogIsInISR()) {
+        if (gIsrLogQueue != NULL) {
+            LogEntry entry;
+            /* Bounded scan — avoids unbounded strlen in ISR context */
+            const size_t maxLen = LOG_MESSAGE_SIZE - 3;
+            size_t len = 0;
+            while (len < maxLen && format[len] != '\0') {
+                len++;
+            }
+            if (len == 0) return 0;
+            memcpy(entry.message, format, len);
+            entry.message[len] = '\r';
+            entry.message[len + 1] = '\n';
+            entry.message[len + 2] = '\0';
 
-        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-        xQueueSendFromISR(gIsrLogQueue, &entry, &xHigherPriorityTaskWoken);
-        portEND_SWITCHING_ISR(xHigherPriorityTaskWoken);
-        return (int)len;
+            BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+            if (xQueueSendFromISR(gIsrLogQueue, &entry, &xHigherPriorityTaskWoken) != pdTRUE) {
+                gIsrLogDropped++;  /* Queue full — count for diagnostics */
+            }
+            portEND_SWITCHING_ISR(xHigherPriorityTaskWoken);
+            return (int)len;
+        }
+        /* Queue not yet initialized — drop the message to avoid
+         * calling vsnprintf/mutex from ISR context */
+        gIsrLogDropped++;
+        return 0;
     }
 
     /* Task path: full vsnprintf formatting */
@@ -509,6 +544,9 @@ void LogMessageDump(scpi_t * context) {
             }
         }
     } while (hasMessage);
+
+    /* Allow one-shot log sites to fire again after user reads the log */
+    Logger_ResetOneShots();
 }
 
 /**
@@ -526,6 +564,9 @@ void LogMessageClear(void) {
         logBuffer.count = 0;
         xSemaphoreGive(logBuffer.mutex);
     }
+
+    /* Allow one-shot log sites to fire again after user clears the log */
+    Logger_ResetOneShots();
 }
 
 /* ── ISR-safe deferred logging ───────────────────────────────────
@@ -556,18 +597,32 @@ static void LogIsrDrainTask(void* pvParameters) {
 }
 
 /**
- * @brief Initialize the ISR log queue and drain task (idempotent).
+ * @brief Initialize the ISR log queue and drain task (idempotent, race-safe).
+ *        Uses create-then-CAS pattern (same as LogMessageInit).
  */
 void LogIsrInit(void) {
     if (gIsrLogQueue != NULL) return;
 
-    gIsrLogQueue = xQueueCreate(LOG_ISR_QUEUE_DEPTH, sizeof(LogEntry));
-    if (gIsrLogQueue == NULL) return;
+    QueueHandle_t newQueue = xQueueCreate(LOG_ISR_QUEUE_DEPTH, sizeof(LogEntry));
+    if (newQueue == NULL) return;
 
+    TaskHandle_t newTaskHandle = NULL;
     if (xTaskCreate(LogIsrDrainTask, "logISR", LOG_ISR_TASK_STACK,
-                    NULL, LOG_ISR_TASK_PRIO, &gIsrLogTaskHandle) != pdPASS) {
-        vQueueDelete(gIsrLogQueue);
-        gIsrLogQueue = NULL;
+                    NULL, LOG_ISR_TASK_PRIO, &newTaskHandle) != pdPASS) {
+        vQueueDelete(newQueue);
+        return;
+    }
+
+    taskENTER_CRITICAL();
+    if (gIsrLogQueue == NULL) {
+        gIsrLogQueue = newQueue;
+        gIsrLogTaskHandle = newTaskHandle;
+        taskEXIT_CRITICAL();
+    } else {
+        /* Another caller won the race */
+        taskEXIT_CRITICAL();
+        vTaskDelete(newTaskHandle);
+        vQueueDelete(newQueue);
     }
 }
 
