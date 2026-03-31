@@ -3,7 +3,10 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <ctype.h>
 #include <xc.h>
+#include "queue.h"
+#include "task.h"
 #include "state/data/BoardData.h"
 
 
@@ -22,11 +25,13 @@
  * - Supports printf-style formatting via LogMessage()
  * - Optionally transmits logs over UART4 (ICSP pin) if enabled
  * - Dumps all stored messages to SCPI interface when LogMessageDump() is called
+ * - Runtime-configurable per-module log levels via SCPI (SYST:LOG:LEV)
  *
  * Usage:
  * - Call LogMessageInit() once at startup (automatically handled on first log)
  * - Use LogMessage("format", ...) to add messages
  * - Call LogMessageDump(context) to flush and reset the buffer
+ * - Use Logger_SetLevel() / SYST:LOG:LEV to change log verbosity at runtime
  */
 
 #ifndef min
@@ -38,6 +43,107 @@
 #endif
 #define UNUSED(x) (void)(x)
 
+/* ── Runtime log levels ──────────────────────────────────────────────
+ * One entry per LogModule_t, initialized to LOG_LEVEL_ERROR (matching
+ * previous compile-time default). Written by SCPI task, read by all
+ * tasks. Single-byte reads/writes are atomic on PIC32MZ.
+ */
+volatile uint8_t gLogLevels[LOG_MODULE_COUNT] = {
+    [LOG_MODULE_POWER]   = LOG_LEVEL_ERROR,
+    [LOG_MODULE_WIFI]    = LOG_LEVEL_ERROR,
+    [LOG_MODULE_SD]      = LOG_LEVEL_ERROR,
+    [LOG_MODULE_USB]     = LOG_LEVEL_ERROR,
+    [LOG_MODULE_SCPI]    = LOG_LEVEL_ERROR,
+    [LOG_MODULE_ADC]     = LOG_LEVEL_ERROR,
+    [LOG_MODULE_DAC]     = LOG_LEVEL_ERROR,
+    [LOG_MODULE_STREAM]  = LOG_LEVEL_ERROR,
+    [LOG_MODULE_ENCODER] = LOG_LEVEL_ERROR,
+    [LOG_MODULE_GENERAL] = LOG_LEVEL_ERROR,
+};
+
+/** Runtime ceilings per module — Logger_SetLevel() clamps to these.
+ *  All modules allow full DEBUG via SCPI.
+ *  WARNING: Do not call LOG_E/LOG_I/LOG_D from ISR context — LogIsInISR()
+ *  detection fails when Harmony clears MIPS EXL/ERL (issue #191). The fix
+ *  is a deferred logging task (also #191). Until then, ensure no log calls
+ *  exist in true ISR handlers. */
+static const uint8_t gLogCeilings[LOG_MODULE_COUNT] = {
+    [LOG_MODULE_POWER]   = LOG_LEVEL_DEBUG,
+    [LOG_MODULE_WIFI]    = LOG_LEVEL_DEBUG,
+    [LOG_MODULE_SD]      = LOG_LEVEL_DEBUG,
+    [LOG_MODULE_USB]     = LOG_LEVEL_DEBUG,
+    [LOG_MODULE_SCPI]    = LOG_LEVEL_DEBUG,
+    [LOG_MODULE_ADC]     = LOG_LEVEL_DEBUG,
+    [LOG_MODULE_DAC]     = LOG_LEVEL_DEBUG,
+    [LOG_MODULE_STREAM]  = LOG_LEVEL_DEBUG,
+    [LOG_MODULE_ENCODER] = LOG_LEVEL_DEBUG,
+    [LOG_MODULE_GENERAL] = LOG_LEVEL_DEBUG,
+};
+
+/** Short names for SCPI display and lookup (must match LogModule_t order) */
+static const char* const gLogModuleNames[LOG_MODULE_COUNT] = {
+    [LOG_MODULE_POWER]   = "POWER",
+    [LOG_MODULE_WIFI]    = "WIFI",
+    [LOG_MODULE_SD]      = "SD",
+    [LOG_MODULE_USB]     = "USB",
+    [LOG_MODULE_SCPI]    = "SCPI",
+    [LOG_MODULE_ADC]     = "ADC",
+    [LOG_MODULE_DAC]     = "DAC",
+    [LOG_MODULE_STREAM]  = "STREAM",
+    [LOG_MODULE_ENCODER] = "ENCODER",
+    [LOG_MODULE_GENERAL] = "GENERAL",
+};
+
+void Logger_SetLevel(LogModule_t module, uint8_t level) {
+    if (module >= LOG_MODULE_COUNT) return;
+    if (level > LOG_LEVEL_DEBUG) level = LOG_LEVEL_DEBUG;
+    /* Clamp to compile-time ceiling */
+    if (level > gLogCeilings[module]) level = gLogCeilings[module];
+    gLogLevels[module] = level;
+}
+
+uint8_t Logger_GetLevel(LogModule_t module) {
+    if (module >= LOG_MODULE_COUNT) return LOG_LEVEL_NONE;
+    return gLogLevels[module];
+}
+
+void Logger_SetAllLevels(uint8_t level) {
+    for (int i = 0; i < LOG_MODULE_COUNT; i++) {
+        Logger_SetLevel((LogModule_t)i, level);
+    }
+}
+
+const char* Logger_GetModuleName(LogModule_t module) {
+    if (module >= LOG_MODULE_COUNT) return "?";
+    return gLogModuleNames[module];
+}
+
+bool Logger_FindModule(const char* name, size_t len, LogModule_t* module) {
+    if (!name || len == 0 || !module) return false;
+    for (int i = 0; i < LOG_MODULE_COUNT; i++) {
+        const char* candidate = gLogModuleNames[i];
+        size_t clen = strlen(candidate);
+        if (clen != len) continue;
+        /* Case-insensitive compare (toupper both sides for robustness) */
+        bool match = true;
+        for (size_t j = 0; j < len; j++) {
+            if (toupper((unsigned char)name[j]) != toupper((unsigned char)candidate[j])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            *module = (LogModule_t)i;
+            return true;
+        }
+    }
+    return false;
+}
+
+uint8_t Logger_GetCeiling(LogModule_t module) {
+    if (module >= LOG_MODULE_COUNT) return LOG_LEVEL_NONE;
+    return gLogCeilings[module];
+}
 
 LogBuffer logBuffer;
 
@@ -46,6 +152,11 @@ static void InitICSPLogging(void);
 static void LogMessageICSP(const char* buffer, int len);
 #endif
 static int LogMessageAdd(const char *message);
+static inline bool LogIsInISR(void);
+
+/* ISR deferred queue — initialized in LogIsrInit(), used by LogMessage's
+ * ISR-aware early path and the drain task. */
+static QueueHandle_t gIsrLogQueue = NULL;
 
 
 #if defined(ENABLE_ICSP_REALTIME_LOG) && (ENABLE_ICSP_REALTIME_LOG == 1) && !defined(__DEBUG)
@@ -188,20 +299,42 @@ static int LogMessageFormatImpl(const char* format, va_list args)
 
 /**
  * @brief Adds a formatted log message to the buffer.
- *        Accepts printf-style formatting.
- * 
- * @param format Format string (printf-style)
- * @param ...    Variable arguments
+ *        ISR-aware: detects context automatically.
+ *        - Task context: full vsnprintf formatting, mutex-protected buffer.
+ *        - ISR context: copies raw format string to deferred queue (no
+ *          vsnprintf — too heavy for ISR stack). Format args are ignored.
+ *
+ * @param format Format string (printf-style; args ignored in ISR context)
+ * @param ...    Variable arguments (only used from task context)
  * @return int   Number of characters written, or 0 on failure
  */
 int LogMessage(const char* format, ...)
 {
-    //UNUSED(format);
+    if (format == NULL) return 0;
+
+    /* ISR path: minimal work — copy string, queue, return */
+    if (LogIsInISR() && gIsrLogQueue != NULL) {
+        LogEntry entry;
+        size_t len = strlen(format);
+        if (len == 0) return 0;
+        if (len > LOG_MESSAGE_SIZE - 3) len = LOG_MESSAGE_SIZE - 3;
+        memcpy(entry.message, format, len);
+        entry.message[len] = '\r';
+        entry.message[len + 1] = '\n';
+        entry.message[len + 2] = '\0';
+
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xQueueSendFromISR(gIsrLogQueue, &entry, &xHigherPriorityTaskWoken);
+        portEND_SWITCHING_ISR(xHigherPriorityTaskWoken);
+        return (int)len;
+    }
+
+    /* Task path: full vsnprintf formatting */
     va_list args;
     va_start(args, format);
     int result = LogMessageFormatImpl(format, args);
     va_end(args);
-    
+
     return result;
 }
 
@@ -243,6 +376,9 @@ void LogMessageInit(void) {
         logBuffer.count = 0;
         logBuffer.mutex = newMutex;
         taskEXIT_CRITICAL();
+
+        // Initialize ISR deferred logging (must be after mutex is set)
+        LogIsrInit();
     } else {
         // Another thread won - discard our mutex
         taskEXIT_CRITICAL();
@@ -251,13 +387,14 @@ void LogMessageInit(void) {
 }
 
 /**
- * @brief Check if currently executing in ISR context (MIPS/PIC32).
+ * @brief Check if currently executing in ISR context.
+ *        Uses FreeRTOS port's uxInterruptNesting counter, which is
+ *        maintained by the assembly ISR wrapper (ISR_Support.h) and is
+ *        reliable even when Harmony clears MIPS EXL/ERL bits.
  * @return true if in ISR, false otherwise
  */
 static inline bool LogIsInISR(void) {
-    // MIPS Status register: EXL (bit 1) or ERL (bit 2) set means exception/ISR
-    uint32_t status = __builtin_mfc0(12, 0);
-    return (status & 0x06) != 0;
+    return uxInterruptNesting != 0;
 }
 
 /**
@@ -282,7 +419,8 @@ static int LogMessageAdd(const char *message) {
     if ((message_len == 0) || (message_len >= LOG_MESSAGE_SIZE))
         return 0;
 
-    // ISR context: cannot use mutex or task APIs - only ICSP output
+    // ISR context: cannot use mutex — only ICSP output.
+    // Use LOG_E_ISR/LOG_I_ISR/LOG_D_ISR for deferred ISR logging.
     if (LogIsInISR()) {
         #if defined(ENABLE_ICSP_REALTIME_LOG) && (ENABLE_ICSP_REALTIME_LOG == 1) && !defined(__DEBUG)
         LogMessageICSP(message, message_len);
@@ -389,3 +527,49 @@ void LogMessageClear(void) {
         xSemaphoreGive(logBuffer.mutex);
     }
 }
+
+/* ── ISR-safe deferred logging ───────────────────────────────────
+ * Messages from ISR context are queued via xQueueSendFromISR and
+ * drained into the main log buffer by a low-priority task.
+ * This avoids the mutex-in-ISR crash (issue #191).
+ */
+
+static TaskHandle_t  gIsrLogTaskHandle = NULL;
+
+#define LOG_ISR_TASK_STACK  128   /* words (512 bytes — only does queue drain) */
+#define LOG_ISR_TASK_PRIO   1     /* lowest priority, runs when nothing else does */
+
+/**
+ * @brief Deferred ISR log drain task.
+ *        Blocks on the ISR queue and forwards messages to the main log buffer.
+ */
+static void LogIsrDrainTask(void* pvParameters) {
+    (void)pvParameters;
+    LogEntry entry;
+
+    for (;;) {
+        if (xQueueReceive(gIsrLogQueue, &entry, portMAX_DELAY) == pdTRUE) {
+            /* LogMessageAdd handles mutex, ICSP output, etc. */
+            LogMessageAdd(entry.message);
+        }
+    }
+}
+
+/**
+ * @brief Initialize the ISR log queue and drain task (idempotent).
+ */
+void LogIsrInit(void) {
+    if (gIsrLogQueue != NULL) return;
+
+    gIsrLogQueue = xQueueCreate(LOG_ISR_QUEUE_DEPTH, sizeof(LogEntry));
+    if (gIsrLogQueue == NULL) return;
+
+    if (xTaskCreate(LogIsrDrainTask, "logISR", LOG_ISR_TASK_STACK,
+                    NULL, LOG_ISR_TASK_PRIO, &gIsrLogTaskHandle) != pdPASS) {
+        vQueueDelete(gIsrLogQueue);
+        gIsrLogQueue = NULL;
+    }
+}
+
+/* LogMessageFromISR removed — LogMessage() is now ISR-aware via
+ * uxInterruptNesting check. Use LOG_E/LOG_I/LOG_D from any context. */
