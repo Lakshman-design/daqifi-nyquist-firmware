@@ -28,6 +28,7 @@
 #include "DaqifiPB/NanoPB_Encoder.h"
 #include "Util/Logger.h"
 #include "Util/CircularBuffer.h"
+#include "Util/StreamingBufferPool.h"
 #include "UsbCdc/UsbCdc.h"
 #include "../HAL/TimerApi/TimerApi.h"
 #include "HAL/ADC/MC12bADC.h"
@@ -138,11 +139,11 @@ static const NanopbFlagsArray fields_sd_metadata = {
 #define max(x,y) ((x) >= (y) ? (x) : (y))
 #endif // max
 
-// Encode buffer must fit the largest single encode output for any interface.
-// Previously used min() which limited all interfaces to the WiFi buffer size (1400).
-// Using max() allows each interface to use its full capacity when active.
-#define BUFFER_SIZE max(max(USBCDC_WBUFFER_SIZE, WIFI_WBUFFER_SIZE), SD_CARD_MANAGER_CONF_WBUFFER_SIZE)
-uint8_t buffer[BUFFER_SIZE];
+// Encoder buffer — allocated from StreamingBufferPool, runtime-adjustable.
+// ENCODER_BUFFER_DEFAULT (8192) and ENCODER_BUFFER_MIN (1024) defined in
+// StreamingBufferPool.h. Benchmark: 8KB optimal for USB, 16KB helps SD.
+static uint8_t* buffer = NULL;
+static uint32_t bufferSize = 0;
 
 //! Pointer to the board configuration data structure to be set in 
 //! initialization
@@ -362,37 +363,55 @@ static void Streaming_TimerHandler(uintptr_t context, uint32_t alarmCount) {
 
 }
 
+void Streaming_SetEncoderBuffer(uint8_t* buf, uint32_t size) {
+    if (buf == NULL || size < ENCODER_BUFFER_MIN) return;
+    buffer = buf;
+    bufferSize = size;
+    LOG_I("Encoder buffer: %u bytes", (unsigned)size);
+}
+
+/**
+ * Compute optimal circular buffer sizes based on active interfaces.
+ *
+ * Benchmark findings (issue #229, buffer sweep):
+ * - USB buffer 4KB-64KB: no throughput difference (USB CDC scheduling is bottleneck)
+ * - WiFi buffer 1.4KB-28KB: no throughput difference (WINC1500 SPI frame is bottleneck)
+ * - Encoder buffer: 8KB optimal across all formats
+ *
+ * Strategy: give active interfaces their compile-time defaults (proven sufficient),
+ * minimize inactive interfaces. All remaining pool space goes to sample depth.
+ */
+void Streaming_ComputeAutoBuffers(uint32_t* outUsbSize, uint32_t* outWifiSize, uint32_t* outSdSize) {
+    StreamingRuntimeConfig* sc = BoardRunTimeConfig_Get(
+        BOARDRUNTIME_STREAMING_CONFIGURATION);
+    sd_card_manager_settings_t* sd = BoardRunTimeConfig_Get(
+        BOARDRUNTIME_SD_CARD_SETTINGS);
+
+    bool hasUsb = (sc->ActiveInterface == StreamingInterface_USB ||
+                   sc->ActiveInterface == StreamingInterface_All);
+    bool hasWifi = (sc->ActiveInterface == StreamingInterface_WiFi ||
+                    sc->ActiveInterface == StreamingInterface_All);
+    bool hasSd = (sd->enable ||
+                  sc->ActiveInterface == StreamingInterface_SD ||
+                  sc->ActiveInterface == StreamingInterface_All);
+
+    // SD: coherent pool (separate from streaming pool), report for informational purposes
+    *outSdSize = hasSd ? 32768 : 0;
+
+    // Active interfaces get compile-time defaults (benchmarked as sufficient).
+    // Inactive interfaces get minimums to maximize sample pool depth.
+    *outWifiSize = hasWifi ? WIFI_CIRCULAR_BUFF_SIZE : STREAMING_WIFI_MIN;
+    *outUsbSize  = hasUsb  ? USBCDC_CIRCULAR_BUFF_SIZE : STREAMING_USB_MIN;
+}
+
 /*!
  * Starts the streaming timer
  */
 static void Streaming_Start(void) {
     if (!gpRuntimeConfigStream->Running) {
-        // Apply dynamic memory configuration if changed.
-        // SCPI validates bounds, but clamp here too for defense-in-depth.
-        if (gpRuntimeConfigStream->IsEnabled) {
-            MemoryConfig* mc = BoardRunTimeConfig_Get(BOARDRUNTIME_MEMORY_CONFIG);
-
-            // NOTE: USB and WiFi circular buffer resize is NOT done here.
-            // The USB/WiFi tasks run concurrently at high priority and may be
-            // actively reading from the circular buffer. Resizing here caused
-            // use-after-free crashes (USB Code 43 descriptor failure).
-            // Circular buffer resize must be done via SCPI commands while
-            // streaming is stopped (the streaming guard enforces this).
-            // Sample pool resize IS safe here because the deferred ISR task
-            // and streaming task are both stopped (Running == false).
-
-            // NOTE: Runtime pool resize is disabled in this PR.
-            // AInSampleList_Destroy + re-Initialize crashes the device due to
-            // an undiagnosed interaction between pool deallocation and the
-            // USB CDC data path. The pool is allocated once at boot (700 samples)
-            // and cannot be changed at runtime. SYST:MEM:SAMP:POOL sets the
-            // config value but it only takes effect on reboot (via BoardData_Init).
-            // TODO: Debug and fix in follow-up PR (issue #229).
-            if (mc->samplePoolCount > 0 && mc->samplePoolCount != AInSampleList_PoolCapacity()) {
-                LOG_I("Pool resize to %u deferred (runtime resize not yet supported)",
-                      (unsigned)mc->samplePoolCount);
-            }
-        }
+        // Buffer and sample pool resize is handled in SCPI_StartStreaming
+        // (USB task context) via StreamingBufferPool_Partition before
+        // IsEnabled is set.
 
         // Clear any stale samples from previous streaming session
         AInPublicSampleList_t* pStale;
@@ -415,7 +434,7 @@ static void Streaming_Start(void) {
         }
 
         // Clear encoding buffer once to prevent stale data artifacts in SD files
-        memset(buffer, 0, BUFFER_SIZE);
+        if (buffer != NULL) memset(buffer, 0, bufferSize);
 
         gSdPbMetadataSent = false;
         gSdFileWasReady = false;
@@ -470,6 +489,17 @@ void Streaming_Init(tStreamingConfig* pStreamingConfigInit,
         StreamingRuntimeConfig* pStreamingRuntimeConfigInit) {
     gpStreamingConfig = pStreamingConfigInit;
     gpRuntimeConfigStream = pStreamingRuntimeConfigInit;
+
+    // Set encoder buffer from pool (partitioned at boot)
+    if (buffer == NULL) {
+        uint8_t* encBuf; uint32_t encLen;
+        StreamingBufferPool_GetEncoder(&encBuf, &encLen);
+        if (encBuf != NULL && encLen > 0) {
+            buffer = encBuf;
+            bufferSize = encLen;
+        }
+    }
+
     TimestampTimer_Init();
     TimerApi_Stop(gpStreamingConfig->TimerIndex);
     TimerApi_InterruptDisable(gpStreamingConfig->TimerIndex);
@@ -629,6 +659,11 @@ void streaming_Task(void) {
             continue;
         }
 
+        // Encoder buffer must be set (from pool) before encoding
+        if (buffer == NULL || bufferSize == 0) {
+            continue;
+        }
+
         AINDataAvailable = !AInSampleList_IsEmpty();
         DIODataAvailable = !DIOSampleList_IsEmpty(&pBoardData->DIOSamples);
 
@@ -662,19 +697,19 @@ void streaming_Task(void) {
                 // interfaces — no special handling needed.
                 if (csv_IsHeaderSent()) {
                     sdHdrLen = csv_GenerateHeaderToBuffer(
-                            (char*)buffer, BUFFER_SIZE);
+                            (char*)buffer, bufferSize);
                 }
             } else if (pRunTimeStreamConf->Encoding == Streaming_Json) {
                 if (json_IsHeaderSent()) {
                     sdHdrLen = json_GenerateHeaderToBuffer(
-                            (char*)buffer, BUFFER_SIZE);
+                            (char*)buffer, bufferSize);
                 }
             } else {
                 // Protobuf: encode a standalone metadata message for SD
                 tBoardData* pBoardData =
                     BoardData_Get(BOARDDATA_ALL_DATA, true);
                 sdHdrLen = Nanopb_Encode(pBoardData,
-                    &fields_sd_metadata, (uint8_t*)buffer, BUFFER_SIZE);
+                    &fields_sd_metadata, (uint8_t*)buffer, bufferSize);
                 if (sdHdrLen > 0) {
                     gSdPbMetadataSent = true;
                 }
@@ -744,7 +779,7 @@ void streaming_Task(void) {
         // whichever outputs have space, and discarded if none do.
         // Previously used min(128, output_free) which caused CSV 16ch
         // encoder failures when USB buffer was full (128 < row size ~172).
-        maxSize = BUFFER_SIZE;
+        maxSize = bufferSize;
 
         nanopbFlag.Size = 0;
 
@@ -1039,7 +1074,7 @@ bool Streaming_GetBenchmarkMode(void) {
         }
 
         // Encode
-        size_t maxEncode = (outSize > BUFFER_SIZE) ? BUFFER_SIZE : outSize;
+        size_t maxEncode = (outSize > bufferSize) ? bufferSize : outSize;
         size_t packetSize = 0;
 
         if (encoding == Streaming_Csv) {

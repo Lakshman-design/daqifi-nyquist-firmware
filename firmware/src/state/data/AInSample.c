@@ -2,18 +2,19 @@
  * @brief Analog input sample queue and object pool implementation.
  *
  * Implements a FreeRTOS queue for streaming analog input samples between the
- * ADC interrupt handler and the streaming task. Uses a dynamically allocated
- * object pool with O(1) free list allocation to eliminate heap overhead at
- * high sample rates.
+ * ADC interrupt handler and the streaming task. Uses an object pool with O(1)
+ * free list allocation to eliminate heap overhead at high sample rates.
  *
- * The pool is allocated from the FreeRTOS heap at AInSampleList_Initialize()
- * and freed at AInSampleList_Destroy(). Pool size is configurable via the
- * maxSize parameter (clamped to MIN/MAX_AIN_SAMPLE_COUNT).
+ * Two initialization paths:
+ * - AInSampleList_InitializeExternal(): Pool memory from StreamingBufferPool
+ *   (static BSS, zero fragmentation). Used at boot and re-partitioned at each
+ *   stream start. FreeRTOS queue is reused across sessions.
+ * - AInSampleList_Initialize(): Legacy heap allocation path (fallback only).
  *
  * Performance characteristics:
  * - Queue: Standard FreeRTOS queue (thread-safe, ISR-safe)
  * - Pool allocation: O(1) via free list (no fragmentation, deterministic timing)
- * - Pool size: Configurable (default DEFAULT_AIN_SAMPLE_COUNT = 700)
+ * - Pool size: Configurable (default DEFAULT_AIN_SAMPLE_COUNT = 1100)
  *
  * @author Javier Longares Abaiz - When Technology becomes art.
  * @web www.javierlongares.com
@@ -34,7 +35,7 @@ static QueueHandle_t analogInputsQueue;
 static uint32_t queueSize = 0;
 
 // =============================================================================
-// Object Pool (dynamically allocated from FreeRTOS heap)
+// Object Pool (from StreamingBufferPool static BSS, or FreeRTOS heap fallback)
 // =============================================================================
 static AInPublicSampleList_t* samplePool = NULL;
 static uint32_t poolCapacity = 0;
@@ -49,6 +50,7 @@ static int16_t* nextFree = NULL;
 
 static SemaphoreHandle_t poolMutex = NULL;
 static volatile bool poolActive = false;
+static bool poolOwnsMemory = false;  // false = external (StreamingBufferPool)
 
 void AInSampleList_Initialize(
                             size_t maxSize,
@@ -119,6 +121,7 @@ void AInSampleList_Initialize(
             configASSERT(0);
             return;
         }
+        poolOwnsMemory = true;
     }
 
     // Initialize object pool mutex
@@ -135,6 +138,81 @@ void AInSampleList_Initialize(
     freeHead = 0;  // Start at first entry
 
     poolActive = true;
+}
+
+void AInSampleList_InitializeExternal(void* poolMem, int16_t* freeMem,
+                                       size_t maxSize) {
+    if (poolMem == NULL || freeMem == NULL || maxSize == 0) {
+        LOG_E("Sample pool external init: NULL or zero (%p, %p, %u)",
+              poolMem, freeMem, (unsigned)maxSize);
+        return;
+    }
+
+    if (maxSize < MIN_AIN_SAMPLE_COUNT) maxSize = MIN_AIN_SAMPLE_COUNT;
+    if (maxSize > MAX_AIN_SAMPLE_COUNT) maxSize = MAX_AIN_SAMPLE_COUNT;
+
+    // Create mutex if first call (boot-time malloc)
+    if (poolMutex == NULL) {
+        poolMutex = xSemaphoreCreateMutex();
+        configASSERT(poolMutex != NULL);
+    }
+
+    // Serialize reconfiguration — blocks any in-flight alloc/free
+    xSemaphoreTake(poolMutex, portMAX_DELAY);
+    poolActive = false;
+
+    // Drain existing queue if present (reuse it to avoid runtime malloc)
+    if (analogInputsQueue != NULL) {
+        AInPublicSampleList_t* pStale;
+        while (xQueueReceive(analogInputsQueue, &pStale, 0) == pdTRUE) {
+            // Drain — old pool memory is being replaced
+        }
+
+        // Reuse existing queue when new size fits (avoids runtime malloc).
+        // Only recreate if new size exceeds current capacity — this can only
+        // happen via explicit SYST:MEM:SAMP:POOL > boot default.
+        if (maxSize > queueSize) {
+            size_t needed = maxSize * sizeof(AInPublicSampleList_t*) + 80;
+            size_t freeHeap = xPortGetFreeHeapSize();
+            if (freeHeap < needed + 1024) {
+                LOG_E("Sample queue resize skipped: need %u, heap free %u",
+                      (unsigned)needed, (unsigned)freeHeap);
+                maxSize = queueSize;  // Keep old queue, clamp pool to fit
+            } else {
+                LOG_I("Sample queue resize: %u -> %u slots (heap free %u)",
+                      (unsigned)queueSize, (unsigned)maxSize, (unsigned)freeHeap);
+                vQueueDelete(analogInputsQueue);
+                analogInputsQueue = xQueueCreate(maxSize, sizeof(AInPublicSampleList_t*));
+                configASSERT(analogInputsQueue != NULL);
+                queueSize = maxSize;
+            }
+        }
+    } else {
+        // First init — must create queue (boot-time malloc, heap is fresh)
+        queueSize = maxSize;
+        analogInputsQueue = xQueueCreate(queueSize, sizeof(AInPublicSampleList_t *));
+        configASSERT(analogInputsQueue != NULL);
+    }
+
+    // Swap to externally provided memory (from StreamingBufferPool)
+    samplePool = (AInPublicSampleList_t*)poolMem;
+    nextFree = freeMem;
+    poolCapacity = maxSize;
+    poolOwnsMemory = false;
+    poolAllocCount = 0;
+    poolMaxAllocCount = 0;
+
+    // Build free list chain
+    for (uint32_t i = 0; i < poolCapacity - 1; i++) {
+        nextFree[i] = (int16_t)(i + 1);
+    }
+    nextFree[poolCapacity - 1] = -1;
+    freeHead = 0;
+
+    poolActive = true;
+    xSemaphoreGive(poolMutex);
+
+    LOG_I("Sample pool: %u samples (external memory)", (unsigned)poolCapacity);
 }
 
 /**
@@ -181,14 +259,16 @@ void AInSampleList_Destroy()
     if (poolMutex != NULL) {
         xSemaphoreTake(poolMutex, portMAX_DELAY);
     }
-    if (samplePool != NULL) {
-        vPortFree(samplePool);
-        samplePool = NULL;
+    if (poolOwnsMemory) {
+        if (samplePool != NULL) {
+            vPortFree(samplePool);
+        }
+        if (nextFree != NULL) {
+            vPortFree(nextFree);
+        }
     }
-    if (nextFree != NULL) {
-        vPortFree(nextFree);
-        nextFree = NULL;
-    }
+    samplePool = NULL;
+    nextFree = NULL;
     poolCapacity = 0;
     freeHead = -1;
     if (poolMutex != NULL) {

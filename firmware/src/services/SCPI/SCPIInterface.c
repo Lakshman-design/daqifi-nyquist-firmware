@@ -38,6 +38,8 @@
 
 /* SD write metrics accessed via sd_card_manager API */
 #include "../streaming.h"
+#include "Util/StreamingBufferPool.h"
+#include "state/data/AInSample.h"
 #include "../csv_encoder.h"
 #include "../JSON_Encoder.h"
 #include "../../HAL/TimerApi/TimerApi.h"
@@ -2168,6 +2170,75 @@ static scpi_result_t SCPI_StartStreaming(scpi_t * context) {
         }
     }
 
+    // Stop streaming before re-partitioning. If called from WiFi task
+    // (priority 2, same as streaming task), the streaming task could
+    // round-robin mid-swap and use partially-swapped buffer pointers.
+    // Stopping first ensures no task is using the old buffers.
+    if (pRunTimeStreamConfig->IsEnabled && pRunTimeStreamConfig->Running) {
+        pRunTimeStreamConfig->IsEnabled = false;
+        Streaming_UpdateState();  // Stop timer + streaming task
+    }
+
+    // Auto-size and apply circular buffer sizes via streaming pool (issue #229).
+    // The pool is one contiguous allocation — re-partitioning is pointer
+    // arithmetic within the pool, no malloc needed.
+    {
+        MemoryConfig* mc = BoardRunTimeConfig_Get(BOARDRUNTIME_MEMORY_CONFIG);
+        bool isAutoMode = (mc->sdCircularBufSize == 0 &&
+                           mc->wifiCircularBufSize == 0 &&
+                           mc->usbCircularBufSize == 0 &&
+                           mc->encoderBufSize == 0 &&
+                           mc->samplePoolCount == 0);
+
+        uint32_t usbSize, wifiSize;
+
+        if (isAutoMode) {
+            uint32_t sdSize;
+            Streaming_ComputeAutoBuffers(&usbSize, &wifiSize, &sdSize);
+            LOG_I("Auto-balance: USB=%u WiFi=%u (SD=%u coherent)",
+                  (unsigned)usbSize, (unsigned)wifiSize, (unsigned)sdSize);
+        } else {
+            usbSize = mc->usbCircularBufSize ? mc->usbCircularBufSize
+                                             : USBCDC_CIRCULAR_BUFF_SIZE;
+            wifiSize = mc->wifiCircularBufSize ? mc->wifiCircularBufSize
+                                               : WIFI_CIRCULAR_BUFF_SIZE;
+            LOG_I("Explicit buffers: USB=%u WiFi=%u",
+                  (unsigned)usbSize, (unsigned)wifiSize);
+        }
+
+        // Wait for any in-flight USB DMA write before swapping buffers.
+        {
+            TickType_t t = xTaskGetTickCount();
+            UsbCdcData_t* pUsb = UsbCdc_GetSettings();
+            while (pUsb->writeTransferHandle != USB_DEVICE_CDC_TRANSFER_HANDLE_INVALID) {
+                if ((xTaskGetTickCount() - t) > pdMS_TO_TICKS(1000)) break;
+                vTaskDelay(1);
+            }
+        }
+
+        // Determine encoder and sample pool sizes (0 = use default/maximize)
+        uint32_t encSize = mc->encoderBufSize ? mc->encoderBufSize
+                                              : ENCODER_BUFFER_DEFAULT;
+        uint32_t poolCount = mc->samplePoolCount;
+
+        // Re-partition the unified pool and swap all buffer pointers.
+        StreamingBufferPool_Partition(usbSize, wifiSize, encSize, poolCount);
+
+        uint8_t *usbBuf, *wifiBuf, *encBuf;
+        uint32_t usbLen, wifiLen, encLen;
+        StreamingBufferPool_GetUsb(&usbBuf, &usbLen);
+        StreamingBufferPool_GetWifi(&wifiBuf, &wifiLen);
+        StreamingBufferPool_GetEncoder(&encBuf, &encLen);
+        UsbCdc_SetWriteBuffer(usbBuf, usbLen);
+        wifi_tcp_server_SetWriteBuffer(wifiBuf, wifiLen);
+        Streaming_SetEncoderBuffer(encBuf, encLen);
+
+        // Re-init sample pool with new region from unified pool
+        void* sPoolMem; int16_t* sFreeMem; uint32_t sCount;
+        StreamingBufferPool_GetSamplePool(&sPoolMem, &sFreeMem, &sCount);
+        AInSampleList_InitializeExternal(sPoolMem, sFreeMem, sCount);
+    }
+
     pRunTimeStreamConfig->IsEnabled = true;
     Streaming_UpdateState();
 
@@ -2660,6 +2731,27 @@ static scpi_result_t SCPI_GetMemSamplePool(scpi_t * context) {
     return SCPI_RES_OK;
 }
 
+static scpi_result_t SCPI_SetMemEncoderBuf(scpi_t * context) {
+    if (SCPI_MemRejectIfStreaming(context)) return SCPI_RES_ERR;
+    int32_t val;
+    if (!SCPI_ParamInt32(context, &val, TRUE)) return SCPI_RES_ERR;
+    // 0 = auto (ENCODER_BUFFER_DEFAULT), 1024-65536 = explicit
+    if (val != 0 && (val < (int32_t)ENCODER_BUFFER_MIN || val > 65536)) {
+        SCPI_ErrorPush(context, SCPI_ERROR_DATA_OUT_OF_RANGE);
+        return SCPI_RES_ERR;
+    }
+    MemoryConfig* mc = BoardRunTimeConfig_Get(BOARDRUNTIME_MEMORY_CONFIG);
+    mc->encoderBufSize = (uint32_t)val;
+    return SCPI_RES_OK;
+}
+
+static scpi_result_t SCPI_GetMemEncoderBuf(scpi_t * context) {
+    MemoryConfig* mc = BoardRunTimeConfig_Get(BOARDRUNTIME_MEMORY_CONFIG);
+    uint32_t effective = mc->encoderBufSize ? mc->encoderBufSize : ENCODER_BUFFER_DEFAULT;
+    SCPI_ResultInt32(context, (int32_t)effective);
+    return SCPI_RES_OK;
+}
+
 static scpi_result_t SCPI_GetMemFree(scpi_t * context) {
     size_t heapFree = xPortGetFreeHeapSize();
     size_t heapMinEver = xPortGetMinimumEverFreeHeapSize();
@@ -2691,59 +2783,48 @@ static scpi_result_t SCPI_GetMemFree(scpi_t * context) {
 static scpi_result_t SCPI_MemAutoBalance(scpi_t * context) {
     if (SCPI_MemRejectIfStreaming(context)) return SCPI_RES_ERR;
     MemoryConfig* mc = BoardRunTimeConfig_Get(BOARDRUNTIME_MEMORY_CONFIG);
-    StreamingRuntimeConfig* sc = BoardRunTimeConfig_Get(BOARDRUNTIME_STREAMING_CONFIGURATION);
-    sd_card_manager_settings_t* sd = BoardRunTimeConfig_Get(BOARDRUNTIME_SD_CARD_SETTINGS);
 
-    bool hasUsb = (sc->ActiveInterface == StreamingInterface_USB || sc->ActiveInterface == StreamingInterface_All);
-    bool hasWifi = (sc->ActiveInterface == StreamingInterface_WiFi || sc->ActiveInterface == StreamingInterface_All);
-    bool hasSd = (sd->enable || sc->ActiveInterface == StreamingInterface_SD || sc->ActiveInterface == StreamingInterface_All);
+    // Compute optimal buffer sizes using shared helper
+    Streaming_ComputeAutoBuffers(&mc->usbCircularBufSize,
+                                 &mc->wifiCircularBufSize,
+                                 &mc->sdCircularBufSize);
 
-    // Count active interfaces for sizing strategy
-    int activeCount = (hasUsb ? 1 : 0) + (hasWifi ? 1 : 0) + (hasSd ? 1 : 0);
+    // Sample pool count = 0 means maximize with remaining pool space
+    mc->samplePoolCount = 0;
 
-    // Set buffer sizes based on active interfaces.
-    // Single-interface: maximize that interface's buffer for best throughput.
-    // Multi-interface: use conservative defaults to share resources.
-    // Note: USB/WiFi circular buffers are allocated once at boot and can't
-    // currently be resized. These values set the config for documentation
-    // and potential future resize support. SD buffer is in coherent pool.
-    if (hasSd) {
-        mc->sdCircularBufSize = (activeCount == 1) ? 32768 : 32768;  // coherent pool limited
-    } else {
-        mc->sdCircularBufSize = 0;
+    // Apply: re-partition unified pool, swap all pointers
+    {
+        UsbCdcData_t* pUsb = UsbCdc_GetSettings();
+        TickType_t t = xTaskGetTickCount();
+        while (pUsb->writeTransferHandle != USB_DEVICE_CDC_TRANSFER_HANDLE_INVALID) {
+            if ((xTaskGetTickCount() - t) > pdMS_TO_TICKS(1000)) break;
+            vTaskDelay(1);
+        }
+
+        StreamingBufferPool_Partition(mc->usbCircularBufSize,
+                                      mc->wifiCircularBufSize,
+                                      ENCODER_BUFFER_DEFAULT, 0);
+
+        uint8_t *usbBuf, *wifiBuf, *encBuf;
+        uint32_t usbLen, wifiLen, encLen;
+        StreamingBufferPool_GetUsb(&usbBuf, &usbLen);
+        StreamingBufferPool_GetWifi(&wifiBuf, &wifiLen);
+        StreamingBufferPool_GetEncoder(&encBuf, &encLen);
+        UsbCdc_SetWriteBuffer(usbBuf, usbLen);
+        wifi_tcp_server_SetWriteBuffer(wifiBuf, wifiLen);
+        Streaming_SetEncoderBuffer(encBuf, encLen);
+
+        void* sPoolMem; int16_t* sFreeMem; uint32_t sCount;
+        StreamingBufferPool_GetSamplePool(&sPoolMem, &sFreeMem, &sCount);
+        AInSampleList_InitializeExternal(sPoolMem, sFreeMem, sCount);
+        mc->samplePoolCount = sCount;
     }
-
-    if (hasWifi) {
-        mc->wifiCircularBufSize = (activeCount == 1) ? 28000 : 14000;
-    } else {
-        mc->wifiCircularBufSize = 1400;  // minimum safe (SOCKET_BUFFER_MAX_LENGTH)
-    }
-
-    if (hasUsb) {
-        mc->usbCircularBufSize = (activeCount == 1) ? 32768 : 16384;
-    } else {
-        mc->usbCircularBufSize = 4096;  // minimum safe (USBCDC_WBUFFER_SIZE)
-    }
-
-    // Calculate available heap for sample pool.
-    // Current pool memory will be freed on resize, so add it back.
-    // Circular buffers are already allocated at boot and don't compete.
-    size_t currentPoolBytes = AInSampleList_PoolCapacity()
-        * (sizeof(AInPublicSampleList_t) + sizeof(int16_t));
-    size_t available = xPortGetFreeHeapSize() + currentPoolBytes;
-    // Reserve 20KB for FreeRTOS internals and transient allocations
-    if (available > 20480) available -= 20480; else available = 0;
-
-    // Maximize sample pool with remaining heap
-    uint32_t poolCount = (uint32_t)(available / (sizeof(AInPublicSampleList_t) + sizeof(int16_t)));
-    if (poolCount < MIN_AIN_SAMPLE_COUNT) poolCount = MIN_AIN_SAMPLE_COUNT;
-    if (poolCount > MAX_AIN_SAMPLE_COUNT) poolCount = MAX_AIN_SAMPLE_COUNT;
-    mc->samplePoolCount = poolCount;
 
     scpi_printf(context, "SD=%u\r\n", (unsigned)mc->sdCircularBufSize);
     scpi_printf(context, "WiFi=%u\r\n", (unsigned)mc->wifiCircularBufSize);
     scpi_printf(context, "USB=%u\r\n", (unsigned)mc->usbCircularBufSize);
     scpi_printf(context, "Pool=%u\r\n", (unsigned)mc->samplePoolCount);
+
     return SCPI_RES_OK;
 }
 
@@ -2987,6 +3068,8 @@ static const scpi_command_t scpi_commands[] = {
     {.pattern = "SYSTem:MEMory:USB:BUFfer?", .callback = SCPI_GetMemUsbBuf,},
     {.pattern = "SYSTem:MEMory:SAMPle:POOL", .callback = SCPI_SetMemSamplePool,},
     {.pattern = "SYSTem:MEMory:SAMPle:POOL?", .callback = SCPI_GetMemSamplePool,},
+    {.pattern = "SYSTem:MEMory:ENCoder:BUFfer", .callback = SCPI_SetMemEncoderBuf,},
+    {.pattern = "SYSTem:MEMory:ENCoder:BUFfer?", .callback = SCPI_GetMemEncoderBuf,},
     {.pattern = "SYSTem:MEMory:FREE?", .callback = SCPI_GetMemFree,},
     {.pattern = "SYSTem:MEMory:AUTO", .callback = SCPI_MemAutoBalance,},
     {.pattern = "SYSTem:MEMory:STACk?", .callback = SCPI_GetStackStats,},
