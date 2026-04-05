@@ -9,12 +9,16 @@
 extern "C" {
 #endif
 
-// Default coherent pool size: 41KB
-// Must accommodate DMA-safe buffers: SD circular (32KB) + SD write (8KB) + headroom
-#define COHERENT_POOL_DEFAULT_SIZE  (41U * 1024U)
+// Default coherent pool size: 124KB
+// Must accommodate DMA-safe buffers: SD write + USB write + WiFi SPI staging
+// All three auto-balanced at stream start via CoherentPool_Reset + re-alloc
+#define COHERENT_POOL_DEFAULT_SIZE  (124U * 1024U)
 
 // Alignment for all pool allocations (cache line size on PIC32MZ)
 #define COHERENT_POOL_ALIGNMENT     16U
+
+_Static_assert((COHERENT_POOL_DEFAULT_SIZE % COHERENT_POOL_ALIGNMENT) == 0,
+               "Coherent pool size must be multiple of COHERENT_POOL_ALIGNMENT");
 
 // Maximum number of named partitions for debugging
 #define COHERENT_POOL_MAX_PARTITIONS 8

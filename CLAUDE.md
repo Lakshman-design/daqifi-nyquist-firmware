@@ -236,7 +236,7 @@ SYSTem:STReam:CLEARSTATS   # Reset all counters
 | `QueueDroppedSamples` | uint32 | Samples lost due to pool exhaustion or full sample queue (pool=700) |
 | `UsbDroppedBytes` | uint32 | Data lost due to USB circular buffer full (16KB) |
 | `WifiDroppedBytes` | uint32 | Data lost due to WiFi circular buffer full (14KB) |
-| `SdDroppedBytes` | uint32 | Data lost due to SD write timeout/partial (8KB buf, 3 retries) |
+| `SdDroppedBytes` | uint32 | Data lost due to SD write timeout/partial (8-64KB buf, 3 retries) |
 | `EncoderFailures` | uint32 | Encoding attempts that returned 0 bytes with data available |
 | `SampleLossPercent` | uint32 | `QueueDroppedSamples / (Total + Dropped) * 100` |
 | `ByteLossPercent` | uint32 | `(USB + WiFi + SD dropped) / TotalBytesStreamed * 100` |
@@ -405,15 +405,17 @@ SYSTem:STORage:SD:BENCHmark?                      # Query results: bytes,ms,bps
 | Interface | Format | Channels | Max Zero-Loss Rate | KB/s |
 |-----------|--------|----------|------------------:|-----:|
 | USB | CSV | 1 | 15 kHz | 239 |
-| USB | CSV | 16 | 3 kHz | 720 |
-| USB | PB | 1 | 20 kHz | 51 |
+| USB | CSV | 16 | 5 kHz | 720 |
+| USB | PB | 1 | 15 kHz | 51 |
 | USB | PB | 8 | 11 kHz | 195 |
 | USB | PB | 16 | 7 kHz | 211 |
-| SD | CSV | 1 | 5 kHz | 85 |
-| SD | CSV | 16 | 1 kHz | 266 |
-| SD | PB | 1 | 11 kHz | 133 |
-| SD | PB | 16 | 7 kHz | 177 |
-| WiFi | PB | 16 | 1 kHz | 49 |
+| SD | CSV | 1 | 11 kHz | 172 |
+| SD | CSV | 8 | 3 kHz | 408 |
+| SD | CSV | 16 | 2 kHz | 546 |
+| SD | PB | 1 | 13 kHz | 148 |
+| SD | PB | 8 | 7 kHz | 185 |
+| SD | PB | 16 | 7 kHz | 199 |
+| WiFi | PB | 16 | 3 kHz | 49 |
 | WiFi | CSV | 16 | 1 kHz | 206 |
 | SD | raw write | — | — | 665 |
 
@@ -575,19 +577,19 @@ All items verified against the actual errata document. Only issues affecting fea
 
 The firmware uses four distinct memory regions, each with different properties:
 
-1. **Streaming Buffer Pool** (276KB static BSS, `firmware/src/Util/StreamingBufferPool.c`)
+1. **Streaming Buffer Pool** (194KB static BSS, `firmware/src/Util/StreamingBufferPool.c`)
    - Single `static uint8_t gPoolStorage[]` array, partitioned at each stream start
-   - Contains: USB circular buffer + WiFi circular buffer + encoder buffer + sample pool + free-list
-   - Layout: `[USB circ | WiFi circ | encoder | <align> | samplePool[] | nextFree[]]`
+   - Contains: USB circular buffer + WiFi circular buffer + encoder buffer + SD circular buffer + sample pool + free-list
+   - Layout: `[USB circ | WiFi circ | encoder | SD circ | <align> | samplePool[] | nextFree[]]`
    - Re-partitioned at each `StartStreamData` based on active interfaces
    - Zero runtime malloc — all resizing is pointer arithmetic within the pool
-   - Auto-balance: USB-only → USB=32KB, WiFi=min, ~1144 samples
+   - Auto-balance: USB-only → USB=64KB, WiFi=min, ~585 samples
    - Query: `SYST:MEM:FREE?` → `SamplePoolCount`, `SamplePoolBytes`
 
-2. **Coherent Pool** (42KB static, DMA-safe, `firmware/src/Util/CoherentPool.c`)
+2. **Coherent Pool** (124KB static, DMA-safe, `firmware/src/Util/CoherentPool.c`)
    - Single `__attribute__((coherent, aligned(16)))` array in KSEG1 (uncached)
-   - Bump allocator with named partitions, initialized at boot
-   - Contains: SD circular buffer (32KB) + SD write buffer (8KB)
+   - Bump allocator with named partitions, reset and re-partitioned at each stream start
+   - Contains: SD DMA write buffer + USB DMA write buffer + WiFi SPI staging buffer. All three auto-balanced at stream start.
    - Query: `SYST:MEM:FREE?` → `CoherentPoolTotal`, `CoherentPoolFree`
 
 3. **FreeRTOS Heap** (75KB, cached, `configTOTAL_HEAP_SIZE` in `FreeRTOSConfig.h`)
@@ -596,22 +598,23 @@ The firmware uses four distinct memory regions, each with different properties:
    - Streaming buffers and sample pool are NOT in heap (moved to Streaming Buffer Pool)
    - Query: `SYST:MEM:FREE?` → `HeapTotal`, `HeapFree`, `HeapMinEverFree`
 
-4. **USB Coherent Struct** (~6KB static, `gRunTimeUsbSttings __attribute__((coherent))`)
-   - USB CDC DMA buffers (read 512B + write 4KB) embedded in coherent struct
+4. **USB Coherent Struct** (~2KB static, `gRunTimeUsbSttings __attribute__((coherent))`)
+   - USB CDC DMA read buffer (512B) embedded in coherent struct
+   - DMA write buffer pointer points into coherent pool (auto-balanced at stream start)
    - Must remain coherent for USB hardware driver DMA compatibility
 
 #### RAM Budget (PIC32MZ 512KB)
 
 | Region | Bytes | Source |
 |--------|------:|--------|
-| Streaming Buffer Pool | 282,624 | Static BSS (276KB) |
+| Streaming Buffer Pool | 198,656 | Static BSS (194KB) |
 | FreeRTOS Heap | 75,000 | Static BSS |
-| Coherent Pool | 41,984 | Static coherent (KSEG1) |
-| USB coherent struct | ~6,000 | Static coherent |
+| Coherent Pool | 126,976 | Static coherent (KSEG1) |
+| USB coherent struct | ~2,000 | Static coherent |
 | Other BSS/data (globals) | ~30,000 | Static BSS |
 | ISR stack | 8,192 | Linker-allocated |
-| **Total used** | **~444,000** | |
-| **Free (linker headroom)** | **~80,000** | |
+| **Total used** | **~441,000** | |
+| **Free (linker headroom)** | **~83,000** | |
 
 #### Heap Allocation Map (75KB total, ~62KB used at boot)
 
@@ -637,7 +640,7 @@ The sample pool lives inside the Streaming Buffer Pool (static BSS). It is re-pa
 - **Memory per sample**: ~210 bytes (208 `AInPublicSampleList_t` + 2 `int16_t` free-list)
 - **Resize**: `StreamingBufferPool_Partition()` re-carves the pool, then `AInSampleList_InitializeExternal()` swaps the memory pointers. FreeRTOS queue is reused (not reallocated) across sessions.
 - **When resized**: At each `StartStreamData` via `SCPI_StartStreaming`
-- **Typical values**: Boot=1100, USB-only auto-balance=1144, USB-32KB+encoder-16KB=~1100
+- **Typical values**: Boot=1100, USB-only auto-balance=~585, multi-interface=varies (see Auto-Balance table)
 - **Peak usage**: Typically 2-4 samples (at 3kHz 16ch). Pool depth provides burst absorption headroom.
 
 #### SCPI Dynamic Memory Configuration
@@ -660,15 +663,15 @@ SYSTem:MEMory:FREE?                   # Full memory diagnostics
 SYSTem:MEMory:AUTO                    # Auto-balance for enabled interfaces
 ```
 
-All USB, WiFi, encoder, and sample pool memory comes from the unified Streaming Buffer Pool (276KB static BSS). Setting any value carves it from the pool; remaining space goes to the sample pool. Setting any field to a non-zero value disables auto-balance for all fields.
+All USB, WiFi, encoder, and sample pool memory comes from the unified Streaming Buffer Pool (194KB static BSS). Setting any value carves it from the pool; remaining space goes to the sample pool. Setting any field to a non-zero value disables auto-balance for all fields.
 
 **Setter Bounds:**
 
 | Command | Min | Max | Constraint |
 |---------|----:|----:|------------|
-| `SD:BUFfer` | 4096 | 65536 | Must be multiple of 512 (sector alignment). SD uses coherent pool, not streaming pool. |
+| `SD:BUFfer` | 4096 | 65536 | Must be multiple of 512 (sector alignment). SD circular buffer is in streaming pool. |
 | `WIFI:BUFfer` | 1400 | 65536 | Min = SOCKET_BUFFER_MAX_LENGTH |
-| `USB:BUFfer` | 4096 | 65536 | Min = USBCDC_WBUFFER_SIZE |
+| `USB:BUFfer` | 2048 | 65536 | Min = STREAMING_USB_MIN |
 | `ENCoder:BUFfer` | 1024 | 65536 | Encoder staging buffer. 8KB optimal for USB, 16KB helps SD throughput. |
 | `SAMPle:POOL` | 0 or 100 | 2000 | 0 = maximize with remaining pool space |
 
@@ -680,8 +683,9 @@ All USB, WiFi, encoder, and sample pool memory comes from the unified Streaming 
 | `HeapFree` | Currently free heap bytes |
 | `HeapUsed` | Currently used heap bytes |
 | `HeapMinEverFree` | Lowest heap free since boot (high-water mark) |
-| `CoherentPoolTotal` | Total coherent pool (41984) |
+| `CoherentPoolTotal` | Total coherent pool (126976) |
 | `CoherentPoolFree` | Free coherent pool bytes |
+| `SdCircularSize` | Current SD circular buffer partition size |
 | `SamplePoolCount` | Current sample pool depth |
 | `SamplePoolBytes` | Sample pool data memory (count × 208) |
 | `SampleNextFreeBytes` | Free-list array memory (count × 2) |
@@ -689,15 +693,31 @@ All USB, WiFi, encoder, and sample pool memory comes from the unified Streaming 
 
 **`SYST:MEM:AUTO` Algorithm:**
 1. Detect active interfaces via `Streaming_ComputeAutoBuffers()` (USB, WiFi, SD)
-2. Single-interface mode: maximize that interface's buffer (e.g., USB-only → USB=32KB, WiFi=1.4KB min)
-3. Multi-interface mode: conservative defaults (USB=16KB, WiFi=14KB)
-4. Encoder buffer: 8KB default
+2. Streaming pool circular buffers: active interfaces get compile-time defaults (USB=64KB, WiFi=32KB, SD=32KB), inactive get minimums (USB=2048, WiFi=1400, SD=512)
+3. Encoder buffer: 16KB when SD active (larger writes reduce SPI overhead), 8KB otherwise
+4. Coherent pool DMA buffers: all three DMA consumers (SD write, USB write, WiFi SPI staging) are auto-balanced from the 124KB coherent pool. Inactive interfaces get minimum (SD=512, USB=512, WiFi=2KB). Active interfaces split remaining space: SD gets 50%, USB gets 30%, WiFi gets 20%. Single-active interface gets everything.
 5. Re-partition streaming pool with computed sizes; sample pool gets all remaining space
-6. Apply immediately: swap buffer pointers + re-init sample pool
+6. CoherentPool_Reset() + re-alloc for SD DMA, USB DMA, and WiFi SPI staging buffers
+7. Apply immediately: swap buffer pointers + re-init sample pool
 
-**Auto-balance at stream start:** When all `MemoryConfig` fields are zero (boot default), auto-balance runs automatically at each `StartStreamData`. Setting any field to non-zero disables auto mode.
+**Auto-balance at stream start:** When all `MemoryConfig` fields are zero (boot default), auto-balance runs automatically at each `StartStreamData`. Setting any field to non-zero disables auto mode. The `SYST:MEM:AUTO` response includes `SdDma=<n>`, `UsbDma=<n>`, `WifiDma=<n>`, and `Encoder=<n>` showing the auto-balanced sizes.
 
-**Implementation:** `firmware/src/Util/StreamingBufferPool.c` (unified pool), `firmware/src/services/streaming.c` (`ComputeAutoBuffers`), `firmware/src/state/data/AInSample.c` (`InitializeExternal`), `firmware/src/services/SCPI/SCPIInterface.c` (SCPI callbacks), `firmware/src/state/runtime/StreamingRuntimeConfig.h` (MemoryConfig struct)
+**Auto-Balance Buffer Sizing by Active Interface:**
+
+| Buffer | USB only | WiFi only | SD only | USB+WiFi | USB+SD | WiFi+SD | All |
+|--------|---:|---:|---:|---:|---:|---:|---:|
+| USB circular (stream pool) | 65,536 | 2,048 | 2,048 | 65,536 | 65,536 | 2,048 | 65,536 |
+| WiFi circular (stream pool) | 1,400 | 32,768 | 1,400 | 32,768 | 1,400 | 32,768 | 32,768 |
+| SD circular (stream pool) | 512 | 512 | 32,768 | 512 | 32,768 | 32,768 | 32,768 |
+| Encoder (stream pool) | 8,192 | 8,192 | 16,384 | 8,192 | 16,384 | 16,384 | 16,384 |
+| SD DMA write (coherent) | 512 | 512 | ~124,000 | 512 | ~62,000 | ~63,000 | ~63,000 |
+| USB DMA write (coherent) | ~124,000 | 512 | 512 | ~37,000 | ~37,000 | 512 | ~38,000 |
+| WiFi SPI staging (coherent) | 2,048 | ~125,000 | 2,048 | ~88,000 | 2,048 | ~63,000 | ~25,000 |
+| Sample pool | ~585 | ~738 | ~695 | ~436 | ~393 | ~546 | ~243 |
+
+All DMA buffers (SD write, USB write, WiFi SPI staging) are auto-balanced from the 124KB coherent pool.
+
+**Implementation:** `firmware/src/Util/StreamingBufferPool.c` (unified pool), `firmware/src/Util/CoherentPool.c` (DMA pool), `firmware/src/services/streaming.c` (`ComputeAutoBuffers`), `firmware/src/state/data/AInSample.c` (`InitializeExternal`), `firmware/src/services/SCPI/SCPIInterface.c` (SCPI callbacks), `firmware/src/state/runtime/StreamingRuntimeConfig.h` (MemoryConfig struct), `firmware/src/config/default/driver/winc/dev/spi/wdrv_winc_spi.c` (WiFi SPI staging)
 
 #### Other Memory Constraints
 - DMA buffers must be cache-aligned and in KSEG1 (coherent pool or coherent attribute)
@@ -1033,6 +1053,20 @@ The project can be built using Microchip tools in WSL/Linux:
    ```
 
 ### Device Testing and SCPI Communication
+
+#### USB CDC Host Read Speed (Critical for Zero-Loss Streaming)
+
+USB CDC streaming is **zero-loss when the host reads at >=1ms intervals**. Slow host-side reading (e.g., 500ms polling loops) causes the device's USB circular buffer to fill, triggering packet drops on the firmware side. This was proven by A/B testing:
+- Slow reader (500ms): USB CSV 16ch@3kHz -> 1,088,768 bytes dropped
+- Fast reader (1ms): USB CSV 16ch@3kHz -> 0 bytes dropped
+
+The firmware pipeline is leak-free. All reported USB byte drops in benchmarks prior to this finding were caused by insufficient host read speed, not firmware limitations.
+
+**Python test suite:** Always use `FastReader` from `test_harness.py` (1ms background thread). Never use `time.sleep(0.5)` polling loops during streaming.
+
+**Measured USB throughput (with fast reader):**
+- USB CSV 16ch@3kHz: 795 KB/s, 0 drops
+- USB CSV 16ch@5kHz: 907 KB/s, 0 drops (frequency-capped to 3.5kHz)
 
 #### Important Testing Notes
 

@@ -29,6 +29,7 @@
 #include "Util/Logger.h"
 #include "Util/CircularBuffer.h"
 #include "Util/StreamingBufferPool.h"
+#include "Util/CoherentPool.h"
 #include "UsbCdc/UsbCdc.h"
 #include "../HAL/TimerApi/TimerApi.h"
 #include "HAL/ADC/MC12bADC.h"
@@ -47,12 +48,8 @@ static uint64_t gTestPatternSampleCount = 0;      // Monotonic counter, reset on
 // Uses uint32_t for guaranteed 32-bit atomic access on PIC32MZ.
 static volatile uint32_t gBenchmarkMode = 0;
 
-// Task priority constants
+// Task priority constant (benchmark no longer changes priority)
 #define STREAMING_ISR_TASK_PRIORITY     8
-#define STREAMING_BENCHMARK_PRIORITY    2
-
-// Saved ISR task priority for restore after benchmark
-static UBaseType_t gSavedIsrPriority = STREAMING_ISR_TASK_PRIORITY;
 
 // SD protobuf metadata: emitted as first message in each SD log file.
 // volatile: written by SD card task (via Streaming_ResetSdPbMetadata),
@@ -371,6 +368,55 @@ void Streaming_SetEncoderBuffer(uint8_t* buf, uint32_t size) {
 }
 
 /**
+ * Write an encoded packet to an output buffer. All-or-nothing semantics:
+ * the full packet is written or nothing is. No partial writes, no garbled
+ * data at the receiver. Blocks until buffer has space or 10s timeout.
+ *
+ * Write functions are all-or-nothing: return len (full packet written) or
+ * 0 (buffer full). This prevents the "convoy effect" where tiny partial
+ * writes burn CPU on mutex lock/unlock without letting the output task drain.
+ *
+ * @param writeFn   All-or-nothing write function
+ * @param buf       Encoded packet to write
+ * @param len       Packet size in bytes
+ * @return          len on success, 0 on 10s timeout (interface dead)
+ */
+typedef size_t (*StreamWriteFn)(const char* buf, size_t len);
+
+#define STREAM_WRITE_TIMEOUT_MS 10000  // 10s — assume interface dead
+
+static size_t Streaming_UsbWrite(const char* buf, size_t len) {
+    return UsbCdc_WriteToBuffer(NULL, buf, len);
+}
+
+static size_t Streaming_WriteWithRetry(StreamWriteFn writeFn,
+                                        const uint8_t* buf, size_t len) {
+    // Phase 1: quick spin — catch in-progress DMA completions
+    for (int i = 0; i < 10; i++) {
+        if (writeFn((const char*)buf, len) == len) return len;
+    }
+
+    // Phase 2: yield — let output tasks (same priority) drain
+    for (int i = 0; i < 50; i++) {
+        taskYIELD();
+        if (writeFn((const char*)buf, len) == len) return len;
+    }
+
+    // Phase 3: tick-based backoff — 1ms sleeps, up to 10s timeout.
+    // If we reach here, the output is overwhelmed. Block the encoder
+    // so backpressure propagates to sample drops (the only acceptable loss).
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(STREAM_WRITE_TIMEOUT_MS);
+    while (xTaskGetTickCount() < deadline) {
+        vTaskDelay(1);
+        if (writeFn((const char*)buf, len) == len) return len;
+    }
+
+    LOG_E("Output write timeout (%u ms, %u bytes) — interface dead",
+          STREAM_WRITE_TIMEOUT_MS, (unsigned)len);
+    return 0;
+}
+
+/**
  * Compute optimal circular buffer sizes based on active interfaces.
  *
  * Benchmark findings (issue #229, buffer sweep):
@@ -381,7 +427,10 @@ void Streaming_SetEncoderBuffer(uint8_t* buf, uint32_t size) {
  * Strategy: give active interfaces their compile-time defaults (proven sufficient),
  * minimize inactive interfaces. All remaining pool space goes to sample depth.
  */
-void Streaming_ComputeAutoBuffers(uint32_t* outUsbSize, uint32_t* outWifiSize, uint32_t* outSdSize) {
+void Streaming_ComputeAutoBuffers(uint32_t* outUsbSize, uint32_t* outWifiSize,
+                                   uint32_t* outSdSize, uint32_t* outSdDmaSize,
+                                   uint32_t* outUsbDmaSize, uint32_t* outWifiDmaSize,
+                                   uint32_t* outEncoderSize) {
     StreamingRuntimeConfig* sc = BoardRunTimeConfig_Get(
         BOARDRUNTIME_STREAMING_CONFIGURATION);
     sd_card_manager_settings_t* sd = BoardRunTimeConfig_Get(
@@ -395,13 +444,58 @@ void Streaming_ComputeAutoBuffers(uint32_t* outUsbSize, uint32_t* outWifiSize, u
                   sc->ActiveInterface == StreamingInterface_SD ||
                   sc->ActiveInterface == StreamingInterface_All);
 
-    // SD: coherent pool (separate from streaming pool), report for informational purposes
-    *outSdSize = hasSd ? 32768 : 0;
+    // SD circular now lives in streaming pool (CPU-only, no DMA).
+    // Active: full default size. Inactive: minimum (pool needs valid pointer).
+    *outSdSize = hasSd ? SD_CARD_MANAGER_DEFAULT_CIRCULAR_SIZE
+                       : STREAMING_SD_CIRCULAR_MIN;
 
-    // Active interfaces get compile-time defaults (benchmarked as sufficient).
-    // Inactive interfaces get minimums to maximize sample pool depth.
-    *outWifiSize = hasWifi ? WIFI_CIRCULAR_BUFF_SIZE : STREAMING_WIFI_MIN;
-    *outUsbSize  = hasUsb  ? USBCDC_CIRCULAR_BUFF_SIZE : STREAMING_USB_MIN;
+    // DMA write buffers: divide entire coherent pool among active consumers.
+    // Inactive interfaces get minimum. Remaining pool space is split
+    // among active interfaces — no committed coherent RAM left unused.
+    {
+        uint32_t pool = CoherentPool_TotalSize();
+        uint32_t overhead = 3 * COHERENT_POOL_ALIGNMENT;  // alignment per alloc
+        uint32_t sdMin = SD_CARD_MANAGER_MIN_WBUFFER_SIZE;
+        uint32_t usbMin = USBCDC_DMA_WBUFFER_MIN;
+        uint32_t wifiMin = WIFI_DMA_MIN;
+
+        // Start with minimums for all, then distribute remaining to active.
+        *outSdDmaSize   = sdMin;
+        *outUsbDmaSize  = usbMin;
+        *outWifiDmaSize = wifiMin;
+
+        uint32_t totalMin = sdMin + usbMin + wifiMin + overhead;
+        if (pool > totalMin) {
+            uint32_t avail = pool - totalMin;
+            uint32_t activeCount = (hasSd ? 1 : 0) + (hasUsb ? 1 : 0) + (hasWifi ? 1 : 0);
+
+            if (activeCount == 1) {
+                // Single active gets all remaining
+                if (hasSd)   *outSdDmaSize   += avail;
+                if (hasUsb)  *outUsbDmaSize  += avail;
+                if (hasWifi) *outWifiDmaSize += avail;
+            } else if (activeCount >= 2) {
+                // Split: SD 50%, USB 30%, WiFi 20%
+                uint32_t sdShare   = hasSd   ? (avail / 2) : 0;
+                uint32_t usbShare  = hasUsb  ? (avail * 3 / 10) : 0;
+                uint32_t wifiShare = hasWifi ? (avail - sdShare - usbShare) : 0;
+                *outSdDmaSize   += sdShare;
+                *outUsbDmaSize  += usbShare;
+                *outWifiDmaSize += wifiShare;
+            }
+        }
+    }
+
+    // Encoder buffer: 16KB when SD active (larger writes reduce SPI overhead),
+    // 8KB default otherwise (sufficient for USB/WiFi).
+    *outEncoderSize = hasSd ? (ENCODER_BUFFER_DEFAULT * 2) : ENCODER_BUFFER_DEFAULT;
+
+    // Circular buffers: larger buffers reduce retry frequency for
+    // all-or-nothing writes, but must leave enough pool for samples.
+    // 64KB USB (85ms at 3kHz×250B) and 32KB WiFi (23ms at 1kHz×1400B)
+    // balance retry avoidance with sample pool depth (~500+ samples).
+    *outWifiSize = hasWifi ? (32U * 1024U) : STREAMING_WIFI_MIN;
+    *outUsbSize  = hasUsb  ? (64U * 1024U) : STREAMING_USB_MIN;
 }
 
 /*!
@@ -437,7 +531,10 @@ static void Streaming_Start(void) {
         if (buffer != NULL) memset(buffer, 0, bufferSize);
 
         gSdPbMetadataSent = false;
-        gSdFileWasReady = false;
+        // If SD file is already open and ready (SCPI_StartStreaming waited
+        // for it), start with true to avoid dropping packets while the
+        // encoder waits for the first sdSize > 0 detection.
+        gSdFileWasReady = sd_card_manager_IsWriteReady();
 
         TimerApi_Initialize(gpStreamingConfig->TimerIndex);
         TimerApi_PeriodSet(gpStreamingConfig->TimerIndex, gpRuntimeConfigStream->ClockPeriod);
@@ -825,11 +922,15 @@ void streaming_Task(void) {
         }
         DIO_TIMING_TEST_WRITE_STATE(1);
         if (packetSize > 0) {
+            // All-or-nothing output writes. On timeout (10s), the interface
+            // is assumed dead. Backpressure propagates to sample queue —
+            // QueueDroppedSamples is the ONLY data loss mechanism.
+            // USB/WiFi: all-or-nothing without retry. Full packet written
+            // or cleanly dropped (no garbled partial data). No retry because
+            // the ISR→encoder feedback loop causes sample queue overflow.
             if (hasUsb) {
-                size_t written = UsbCdc_WriteToBuffer(NULL, (const char *) buffer, packetSize);
-                if (written < packetSize) {
-                    gStreamStats.usbDroppedBytes += (packetSize - written);
-                    // Critical section: gQuesBits is also RMW'd by deferred ISR task
+                if (Streaming_UsbWrite((const char*)buffer, packetSize) != packetSize) {
+                    gStreamStats.usbDroppedBytes += packetSize;
                     taskENTER_CRITICAL();
                     gQuesBits |= QUES_BIT_USB_OVERFLOW;
                     taskEXIT_CRITICAL();
@@ -837,10 +938,8 @@ void streaming_Task(void) {
                 }
             }
             if (hasWifi) {
-                size_t written = wifi_manager_WriteToBuffer((const char *) buffer, packetSize);
-                if (written < packetSize) {
-                    gStreamStats.wifiDroppedBytes += (packetSize - written);
-                    // Critical section: gQuesBits is also RMW'd by deferred ISR task
+                if (wifi_manager_WriteToBuffer((const char*)buffer, packetSize) != packetSize) {
+                    gStreamStats.wifiDroppedBytes += packetSize;
                     taskENTER_CRITICAL();
                     gQuesBits |= QUES_BIT_WIFI_OVERFLOW;
                     taskEXIT_CRITICAL();
@@ -848,44 +947,13 @@ void streaming_Task(void) {
                 }
             }
             if (hasSD && gSdFileWasReady) {
-                // Guard: gSdFileWasReady is reset by the SD task during file
-                // rotation (via Streaming_ResetSdPbMetadata).  If it went
-                // false while we were encoding, a rotation happened and our
-                // buffer belongs to the old file — writing it now would place
-                // non-metadata data at position 0 of the NEW file.  Skipping
-                // the write lets the next iteration detect the new file,
-                // include metadata, and write at position 0.
-                const uint8_t* p = buffer;
-                size_t remaining = packetSize;
-                size_t total_written = 0;
-                unsigned int attempts = 0;
-                const unsigned int max_attempts = 3;
-
-                while (remaining > 0 && attempts < max_attempts) {
-                    size_t w = sd_card_manager_WriteToBuffer((const char *)p, remaining);
-                    if (w == 0) {
-                        // No progress, break to avoid tight loop
-                        break;
-                    }
-                    total_written += w;
-                    p += w;
-                    remaining -= w;
-                    attempts++;
-                    if (remaining > 0) {
-                        // Partial write, yield to give SD task a chance
-                        taskYIELD();
-                    }
-                }
-
-                if (total_written != packetSize) {
-                    gStreamStats.sdDroppedBytes += (packetSize - total_written);
-                    // Critical section: gQuesBits is also RMW'd by deferred ISR task
+                if (Streaming_WriteWithRetry(sd_card_manager_WriteToBuffer, buffer, packetSize) == 0) {
+                    gStreamStats.sdDroppedBytes += packetSize;
                     taskENTER_CRITICAL();
                     gQuesBits |= QUES_BIT_SD_OVERFLOW;
                     taskEXIT_CRITICAL();
-                    LOG_E_SESSION(LOG_SESSION_SD_DROP, "Streaming: SD write overflow detected");
+                    LOG_E_SESSION(LOG_SESSION_SD_DROP, "Streaming: SD interface dead (10s timeout)");
                 }
-
             }
 
             // Track packets discarded due to output buffer backpressure.
@@ -959,21 +1027,12 @@ uint32_t Streaming_GetTestPattern(void) {
 }
 
 void Streaming_SetBenchmarkMode(bool enabled) {
-    // Serialize transitions — prevents race if called from USB and WiFi SCPI
-    taskENTER_CRITICAL();
-    if (enabled && gBenchmarkMode == 0) {
-        if (gStreamingInterruptHandle != NULL) {
-            gSavedIsrPriority = uxTaskPriorityGet(gStreamingInterruptHandle);
-            vTaskPrioritySet(gStreamingInterruptHandle, STREAMING_BENCHMARK_PRIORITY);
-        }
-        gBenchmarkMode = 1;
-    } else if (!enabled && gBenchmarkMode != 0) {
-        gBenchmarkMode = 0;
-        if (gStreamingInterruptHandle != NULL) {
-            vTaskPrioritySet(gStreamingInterruptHandle, gSavedIsrPriority);
-        }
-    }
-    taskEXIT_CRITICAL();
+    // Benchmark mode only bypasses the frequency cap.
+    // The ISR task priority is no longer changed — the normal hierarchy
+    // (ISR=8, USB=7, encoder=2) is correct with all-or-nothing retry.
+    // Dropping ISR to priority 2 caused the encoder retry to compete
+    // with ISR for CPU, flooding the sample queue.
+    gBenchmarkMode = enabled ? 1 : 0;
 }
 
 bool Streaming_GetBenchmarkMode(void) {
@@ -1096,16 +1155,19 @@ bool Streaming_GetBenchmarkMode(void) {
         totalBytes += packetSize;
         totalSamples++;
 
-        // Write to output
-        size_t written = 0;
-        switch (interface) {
-            case 0: written = UsbCdc_WriteToBuffer(NULL, (const char*)buffer, packetSize); break;
-            case 1: written = wifi_tcp_server_WriteBuffer((const char*)buffer, packetSize); break;
-            case 2: written = sd_card_manager_WriteToBuffer((const char*)buffer, packetSize); break;
-        }
+        // Write to output with adaptive retry
+        {
+            StreamWriteFn fn = NULL;
+            switch (interface) {
+                case 0: fn = Streaming_UsbWrite; break;
+                case 1: fn = wifi_manager_WriteToBuffer; break;
+                case 2: fn = sd_card_manager_WriteToBuffer; break;
+            }
+            size_t total_written = fn ? Streaming_WriteWithRetry(fn, (const uint8_t*)buffer, packetSize) : 0;
 
-        if (written < packetSize) {
-            outputDrops += (packetSize - written);
+            if (total_written < packetSize) {
+                outputDrops += (packetSize - total_written);
+            }
         }
 
         // Yield periodically to let output tasks drain

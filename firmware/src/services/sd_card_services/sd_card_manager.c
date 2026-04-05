@@ -4,6 +4,7 @@
 #include <string.h>
 #include "Util/Logger.h"
 #include "Util/CoherentPool.h"
+#include "Util/StreamingBufferPool.h"
 #include "sd_card_manager.h"
 #include "services/UsbCdc/UsbCdc.h"
 #include "services/streaming.h"  // For Streaming_ResetSdPbMetadata on file rotation
@@ -82,7 +83,7 @@ static uint32_t gSdSharedBufferSize = 0;
 // Prevents race conditions from cross-task state changes via UpdateSettings()
 static SemaphoreHandle_t gSDOpMutex = NULL;
 static bool gLoggedUnmountFail = false;
-static bool gLoggedWriteBufferTimeout = false;
+// gLoggedWriteBufferTimeout removed — WriteToBuffer is now non-blocking
 static volatile bool gTransferAbortRequested = false;
 static int gFormatStatus = 0;  // 0=idle, 1=in progress, 2=success, -1=failed
 static uint32_t gFormatSectorsEstimate = 0;  // Estimated total sectors written during format
@@ -367,15 +368,14 @@ static void ListFilesInDirectoryChunked(const char* dirPath, uint8_t *pStrBuff, 
 bool sd_card_manager_Init(sd_card_manager_settings_t *pSettings) {
     static bool isInitDone = false;
     if (!isInitDone) {
-        // Allocate SD buffers from coherent pool (DMA-safe)
-        gSdSharedBufferSize = SD_CARD_MANAGER_CIRCULAR_BUFFER_SIZE;
-        gSdSharedBuffer = CoherentPool_Alloc("SD_circular", gSdSharedBufferSize);
+        // Get SD circular buffer from streaming pool (CPU-only, no DMA needed)
+        StreamingBufferPool_GetSdCircular(&gSdSharedBuffer, &gSdSharedBufferSize);
         if (gSdSharedBuffer == NULL) {
-            LOG_E("[SD] Failed to allocate %u bytes from coherent pool for circular buffer",
-                  (unsigned)gSdSharedBufferSize);
+            LOG_E("[SD] Failed to get SD circular buffer from streaming pool");
             return false;
         }
 
+        // Allocate SD DMA write buffer from coherent pool (DMA-safe for SPI/FatFS)
         gSDCardData.writeBufferSize = SD_CARD_MANAGER_CONF_WBUFFER_SIZE;
         gSDCardData.writeBuffer = CoherentPool_Alloc("SD_write", gSDCardData.writeBufferSize);
         if (gSDCardData.writeBuffer == NULL) {
@@ -384,7 +384,7 @@ bool sd_card_manager_Init(sd_card_manager_settings_t *pSettings) {
             return false;
         }
 
-        // Initialize circular buffer using pool-allocated coherent memory
+        // Initialize circular buffer using streaming pool memory
         CircularBuf_InitExternal(&gSDCardData.wCirbuf, CircularBufferToSDWrite,
                                  gSdSharedBuffer, gSdSharedBufferSize);
 
@@ -1425,62 +1425,44 @@ void sd_card_manager_ProcessState() {
     }
 }
 
-size_t sd_card_manager_WriteToBuffer(const char* pData, size_t len) {
-    size_t bytesAdded = 0;
-    if (len == 0) {
-        LOG_D("SD WriteToBuffer: zero length");
-        return 0;
-    }
-    if (gpSDCardSettings->enable != 1 || gpSDCardSettings->mode != SD_CARD_MANAGER_MODE_WRITE) {
-        // Reset so a fresh timeout is logged if SD is re-enabled
-        gLoggedWriteBufferTimeout = false;
-        return 0;
-    }
+void sd_card_manager_SetWriteBuffer(uint8_t* buf, uint32_t size) {
+    if (buf == NULL || size == 0) return;
 
-    // Reject writes larger than buffer capacity (would spin until timeout)
-    if (len > gSDCardData.wCirbuf.buf_size) {
-        LOG_E("[SD] WriteToBuffer oversize: len=%u, cap=%u", (unsigned)len, (unsigned)gSDCardData.wCirbuf.buf_size);
-        return 0;
-    }
-
-    // Wait for buffer space with mutex protection and timeout
-    bool hasSpace = false;
-    TickType_t startTime = xTaskGetTickCount();
-    TickType_t timeoutTicks = pdMS_TO_TICKS(SD_CARD_MANAGER_WRITE_TIMEOUT_MS);
-    
-    while (!hasSpace) {
-        // Check buffer space with mutex protection
-        SD_TakeMutexDebug(gSDCardData.wMutex, "write_buffer_space_check");
-        hasSpace = (CircularBuf_NumBytesFree(&gSDCardData.wCirbuf) >= len);
-        xSemaphoreGive(gSDCardData.wMutex);
-        
-        if (!hasSpace) {
-            // Check for timeout
-            if ((xTaskGetTickCount() - startTime) >= timeoutTicks) {
-                if (!gLoggedWriteBufferTimeout) {
-                    gLoggedWriteBufferTimeout = true;
-                    LOG_E("[SD] WriteToBuffer timeout - buffer full for %u ms", SD_CARD_MANAGER_WRITE_TIMEOUT_MS);
-                }
-                return 0;
-            }
-            vTaskDelay(pdMS_TO_TICKS(SD_CARD_MANAGER_WRITE_WAIT_INTERVAL_MS));
-        }
-    }
-    
-    //Obtain ownership of the mutex object
-    SD_TakeMutexDebug(gSDCardData.wMutex, "write_buffer_add");
-    bytesAdded = CircularBuf_AddBytes(&gSDCardData.wCirbuf, (uint8_t*) pData, len);
+    SD_TakeMutexDebug(gSDCardData.wMutex, "set_write_buffer");
+    gSDCardData.writeBuffer = buf;
+    gSDCardData.writeBufferSize = size;
+    gSDCardData.writeBufferLength = 0;
+    gSDCardData.sdCardWriteBufferOffset = 0;
     xSemaphoreGive(gSDCardData.wMutex);
-    gLoggedWriteBufferTimeout = false;
+}
 
-    static uint32_t totalWritten = 0;
-    static uint32_t writeCount = 0;
-    totalWritten += bytesAdded;
-    writeCount++;
-    if (writeCount % 10 == 0) {  // Log every 10 writes to avoid spam
-        LOG_D("[SD] WriteToBuffer: %u writes, %u total bytes\r\n", writeCount, totalWritten);
+void sd_card_manager_SetCircularBuffer(uint8_t* buf, uint32_t size) {
+    if (buf == NULL || size == 0) return;
+
+    SD_TakeMutexDebug(gSDCardData.wMutex, "set_circular_buffer");
+    gSdSharedBuffer = buf;
+    gSdSharedBufferSize = size;
+    CircularBuf_InitExternal(&gSDCardData.wCirbuf, CircularBufferToSDWrite,
+                             gSdSharedBuffer, gSdSharedBufferSize);
+    xSemaphoreGive(gSDCardData.wMutex);
+}
+
+size_t sd_card_manager_WriteToBuffer(const char* pData, size_t len) {
+    if (len == 0) return 0;
+    if (gpSDCardSettings->enable != 1 || gpSDCardSettings->mode != SD_CARD_MANAGER_MODE_WRITE) {
+        return 0;
     }
 
+    // All-or-nothing: only write if full packet fits. Prevents convoy effect
+    // where tiny partial writes burn CPU on mutex cycles. Callers retry via
+    // Streaming_WriteWithRetry — no data loss.
+    SD_TakeMutexDebug(gSDCardData.wMutex, "write_buffer_add");
+    if (CircularBuf_NumBytesFree(&gSDCardData.wCirbuf) < len) {
+        xSemaphoreGive(gSDCardData.wMutex);
+        return 0;
+    }
+    size_t bytesAdded = CircularBuf_AddBytes(&gSDCardData.wCirbuf, (uint8_t*)pData, len);
+    xSemaphoreGive(gSDCardData.wMutex);
     return bytesAdded;
 }
 
