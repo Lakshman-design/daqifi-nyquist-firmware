@@ -48,7 +48,10 @@
 #include "Util/CoherentPool.h"
 #include "state/data/AInSample.h"  // For AInSampleList_PoolCapacity
 #include "services/wifi_services/wifi_tcp_server.h"  // For WIFI_CIRCULAR_BUFF_SIZE
-#include "config/default/driver/winc/include/dev/wdrv_winc_spi.h"  // For WDRV_WINC_SPI_SetBuffer
+#include "config/default/driver/winc/include/dev/wdrv_winc_spi.h"  // For WDRV_WINC_SPI_SetBuffer/WaitIdle
+#ifndef DAQIFI_WINC_SPI_PATCHED
+#error "wdrv_winc_spi.h was overwritten by Harmony/MCC! Re-apply DAQiFi patches. See wiki: Harmony-Driver-Patches"
+#endif
 
 //
 // SCPI STATus:OPERation condition register bit assignments (IEEE 488.2 Sec 11.6.1)
@@ -1948,6 +1951,40 @@ scpi_result_t SCPI_GetStreamStats(scpi_t * context) {
     return SCPI_RES_OK;
 }
 
+/**
+ * Quiesce all DMA consumers and reset the coherent pool.
+ * Closes SD file (filesystem safety), waits for WiFi SPI idle.
+ * USB is assumed already waited by caller.
+ * @return true if successful, false if a timeout occurred
+ */
+static bool SCPI_QuiesceAndResetCoherentPool(void) {
+    // SD: close write file so f_write can't be mid-DMA during reset.
+    // Only interrupt WRITE mode (DMA consumer). Leave READ/LIST/DELETE alone.
+    {
+        sd_card_manager_settings_t* pSd = BoardRunTimeConfig_Get(BOARDRUNTIME_SD_CARD_SETTINGS);
+        if (pSd && pSd->mode == SD_CARD_MANAGER_MODE_WRITE) {
+            pSd->mode = SD_CARD_MANAGER_MODE_NONE;
+            sd_card_manager_UpdateSettings(pSd);
+        }
+        int sdWait = 0;
+        while (!sd_card_manager_IsIdle() && sdWait < 500) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            sdWait++;
+        }
+        if (sdWait >= 500) {
+            LOG_E("SD idle timeout before DMA resize (%d ms)", sdWait * 10);
+            return false;
+        }
+    }
+    // WiFi: wait for any in-flight SPI DMA to complete.
+    if (!WDRV_WINC_SPI_WaitIdle(1000)) {
+        LOG_E("WiFi SPI idle timeout before DMA resize");
+        return false;
+    }
+    CoherentPool_Reset();
+    return true;
+}
+
 static scpi_result_t SCPI_StartStreaming(scpi_t * context) {
     int32_t freq;
 
@@ -2269,8 +2306,12 @@ static scpi_result_t SCPI_StartStreaming(scpi_t * context) {
             usbDmaSize = USBCDC_DMA_WBUFFER_MIN;
             wifiDmaSize = WIFI_DMA_MIN;
         }
-        // Safe: streaming is stopped (no DMA in flight).
-        CoherentPool_Reset();
+        // Quiesce all DMA consumers (SD file close, WiFi SPI idle) and reset pool.
+        // USB writeTransferHandle already waited above.
+        if (!SCPI_QuiesceAndResetCoherentPool()) {
+            SCPI_ErrorPush(context, SCPI_ERROR_EXECUTION_ERROR);
+            return SCPI_RES_ERR;
+        }
         uint8_t* sdDmaBuf = CoherentPool_Alloc("SD_write", sdDmaSize);
         if (sdDmaBuf == NULL) {
             LOG_E("CoherentPool alloc failed: SD_write (%u)", (unsigned)sdDmaSize);
@@ -2294,6 +2335,20 @@ static scpi_result_t SCPI_StartStreaming(scpi_t * context) {
         void* sPoolMem; int16_t* sFreeMem; uint32_t sCount;
         StreamingBufferPool_GetSamplePool(&sPoolMem, &sFreeMem, &sCount);
         AInSampleList_InitializeExternal(sPoolMem, sFreeMem, sCount);
+
+        // Re-enable SD if it was closed for DMA quiesce
+        if (sdLoggingRequested) {
+            pSDCardSettings->mode = SD_CARD_MANAGER_MODE_WRITE;
+            sd_card_manager_UpdateSettings(pSDCardSettings);
+            int readyWait = 0;
+            while (!sd_card_manager_IsWriteReady() && readyWait < 500) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                readyWait++;
+            }
+            if (!sd_card_manager_IsWriteReady()) {
+                LOG_E("SD file not ready after DMA resize (%d ms)", readyWait * 10);
+            }
+        }
     }
 
     pRunTimeStreamConfig->IsEnabled = true;
@@ -2843,17 +2898,14 @@ static scpi_result_t SCPI_MemAutoBalance(scpi_t * context) {
     if (SCPI_MemRejectIfStreaming(context)) return SCPI_RES_ERR;
     MemoryConfig* mc = BoardRunTimeConfig_Get(BOARDRUNTIME_MEMORY_CONFIG);
 
-    // Compute optimal buffer sizes using shared helper
+    // Compute optimal buffer sizes into LOCAL variables — do NOT persist
+    // into MemoryConfig. Keeping mc at zero preserves auto mode for
+    // subsequent StartStreamData calls.
+    uint32_t usbSize, wifiSize, sdCircSize;
     uint32_t sdDmaSize, usbDmaSize, wifiDmaSize, encSize;
-    Streaming_ComputeAutoBuffers(&mc->usbCircularBufSize,
-                                 &mc->wifiCircularBufSize,
-                                 &mc->sdCircularBufSize,
+    Streaming_ComputeAutoBuffers(&usbSize, &wifiSize, &sdCircSize,
                                  &sdDmaSize, &usbDmaSize, &wifiDmaSize,
                                  &encSize);
-    mc->encoderBufSize = encSize;
-
-    // Sample pool count = 0 means maximize with remaining pool space
-    mc->samplePoolCount = 0;
 
     // Apply: re-partition unified pool, swap all pointers
     {
@@ -2864,10 +2916,8 @@ static scpi_result_t SCPI_MemAutoBalance(scpi_t * context) {
             vTaskDelay(1);
         }
 
-        StreamingBufferPool_Partition(mc->usbCircularBufSize,
-                                      mc->wifiCircularBufSize,
-                                      encSize,
-                                      mc->sdCircularBufSize, 0);
+        StreamingBufferPool_Partition(usbSize, wifiSize, encSize,
+                                      sdCircSize, 0);
 
         uint8_t *usbBuf, *wifiBuf, *encBuf, *sdCircBuf;
         uint32_t usbLen, wifiLen, encLen, sdCircLen;
@@ -2901,7 +2951,10 @@ static scpi_result_t SCPI_MemAutoBalance(scpi_t * context) {
             usbDmaSize = USBCDC_DMA_WBUFFER_MIN;
             wifiDmaSize = WIFI_DMA_MIN;
         }
-        CoherentPool_Reset();
+        if (!SCPI_QuiesceAndResetCoherentPool()) {
+            SCPI_ErrorPush(context, SCPI_ERROR_EXECUTION_ERROR);
+            return SCPI_RES_ERR;
+        }
         uint8_t* sdDmaBuf = CoherentPool_Alloc("SD_write", sdDmaSize);
         if (sdDmaBuf == NULL) {
             LOG_E("CoherentPool alloc failed: SD_write (%u)", (unsigned)sdDmaSize);
@@ -2924,20 +2977,13 @@ static scpi_result_t SCPI_MemAutoBalance(scpi_t * context) {
         void* sPoolMem; int16_t* sFreeMem; uint32_t sCount;
         StreamingBufferPool_GetSamplePool(&sPoolMem, &sFreeMem, &sCount);
         AInSampleList_InitializeExternal(sPoolMem, sFreeMem, sCount);
-        mc->samplePoolCount = sCount;
     }
 
-    // Circular buffers (streaming pool)
-    scpi_printf(context, "USB=%u\r\n", (unsigned)mc->usbCircularBufSize);
-    scpi_printf(context, "WiFi=%u\r\n", (unsigned)mc->wifiCircularBufSize);
-    scpi_printf(context, "SD=%u\r\n", (unsigned)mc->sdCircularBufSize);
-    scpi_printf(context, "Encoder=%u\r\n", (unsigned)encSize);
-    scpi_printf(context, "Pool=%u\r\n", (unsigned)mc->samplePoolCount);
-    // DMA buffers (coherent pool)
-    scpi_printf(context, "UsbDma=%u\r\n", (unsigned)usbDmaSize);
-    scpi_printf(context, "WifiDma=%u\r\n", (unsigned)wifiDmaSize);
-    scpi_printf(context, "SdDma=%u\r\n", (unsigned)sdDmaSize);
+    // Ensure MemoryConfig stays zeroed — auto mode for next StartStreamData
+    memset(mc, 0, sizeof(MemoryConfig));
 
+    // SCPI compliance: commands (no ?) don't return data.
+    // Use SYST:MEM:FREE? to query applied sizes.
     return SCPI_RES_OK;
 }
 

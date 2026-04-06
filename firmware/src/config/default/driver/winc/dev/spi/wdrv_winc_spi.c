@@ -61,6 +61,12 @@ typedef struct
 } WDRV_WINC_SPIDCPT;
 
 // *****************************************************************************
+// DAQiFi MODIFICATION SENTINEL — if this line causes a build error after an
+// MCC/Harmony update, the file was overwritten. Re-apply patches from:
+// https://github.com/daqifi/daqifi-nyquist-firmware/wiki/Harmony-Driver-Patches
+// Changes: static alignedBuffer[] → CoherentPool pointer, added SetBuffer/WaitIdle
+#define DAQIFI_WINC_SPI_PATCHED 1
+// *****************************************************************************
 // *****************************************************************************
 // Section: Global Data
 // *****************************************************************************
@@ -79,6 +85,19 @@ void WDRV_WINC_SPI_SetBuffer(uint8_t* buf, uint32_t size) {
     alignedBufferSize = size;
 }
 
+bool WDRV_WINC_SPI_WaitIdle(uint32_t timeout_ms) {
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeoutTicks = pdMS_TO_TICKS(timeout_ms);
+    while ((xTaskGetTickCount() - start) < timeoutTicks) {
+        if (spiDcpt.transferTxHandle == DRV_SPI_TRANSFER_HANDLE_INVALID &&
+            spiDcpt.transferRxHandle == DRV_SPI_TRANSFER_HANDLE_INVALID) {
+            return true;
+        }
+        vTaskDelay(1);
+    }
+    return false;
+}
+
 // *****************************************************************************
 // *****************************************************************************
 // Section: File scope functions
@@ -92,6 +111,10 @@ static void spiTransferEventHandler(DRV_SPI_TRANSFER_EVENT event,
     {
         case DRV_SPI_TRANSFER_EVENT_COMPLETE:
             // This means the data was transferred.
+            // Post semaphore only — do NOT clear handle here.
+            // Handle is cleared in SPISend/SPIReceive AFTER post-DMA
+            // memcpy completes. This prevents WaitIdle() from returning
+            // true while the task is still using alignedBuffer.
             if (spiDcpt.transferTxHandle == handle)
             {
                 OSAL_SEM_PostISR(&spiDcpt.txSyncSem);
@@ -104,7 +127,15 @@ static void spiTransferEventHandler(DRV_SPI_TRANSFER_EVENT event,
             break;
 
         case DRV_SPI_TRANSFER_EVENT_ERROR:
-            // Error handling here.
+            // Post semaphore on error to prevent deadlock in SPISend/SPIReceive.
+            if (spiDcpt.transferTxHandle == handle)
+            {
+                OSAL_SEM_PostISR(&spiDcpt.txSyncSem);
+            }
+            else if (spiDcpt.transferRxHandle == handle)
+            {
+                OSAL_SEM_PostISR(&spiDcpt.rxSyncSem);
+            }
             break;
 
         default:
@@ -129,6 +160,7 @@ static void spiTransferEventHandler(DRV_SPI_TRANSFER_EVENT event,
 
 bool WDRV_WINC_SPISend(void* pTransmitData, size_t txSize)
 {
+    if (alignedBuffer == NULL || txSize > alignedBufferSize) return false;
     memcpy(alignedBuffer, pTransmitData, txSize);
     DRV_SPI_WriteTransferAdd(spiDcpt.spiHandle, alignedBuffer, txSize, &spiDcpt.transferTxHandle);
 
@@ -141,6 +173,8 @@ bool WDRV_WINC_SPISend(void* pTransmitData, size_t txSize)
     {
     }
 
+    // DMA complete, buffer no longer in use — mark idle for WaitIdle()
+    spiDcpt.transferTxHandle = DRV_SPI_TRANSFER_HANDLE_INVALID;
     return true;
 }
 
@@ -163,6 +197,7 @@ bool WDRV_WINC_SPIReceive(void* pReceiveData, size_t rxSize)
 {
     static uint8_t dummy = 0;
 
+    if (alignedBuffer == NULL || rxSize > alignedBufferSize) return false;
     DRV_SPI_WriteReadTransferAdd(spiDcpt.spiHandle, &dummy, 1, alignedBuffer, rxSize, &spiDcpt.transferRxHandle);
 
     if (DRV_SPI_TRANSFER_HANDLE_INVALID == spiDcpt.transferRxHandle)
@@ -176,6 +211,8 @@ bool WDRV_WINC_SPIReceive(void* pReceiveData, size_t rxSize)
 
     memcpy(pReceiveData, alignedBuffer, rxSize);
 
+    // Buffer fully consumed — mark idle for WaitIdle()
+    spiDcpt.transferRxHandle = DRV_SPI_TRANSFER_HANDLE_INVALID;
     return true;
 }
 
@@ -216,6 +253,11 @@ bool WDRV_WINC_SPIOpen(void)
         LOG_E("WiFi SPI: rxSyncSem create failed (heap exhaustion?)\r\n");
         return false;
     }
+
+    // Initialize transfer handles to INVALID so WaitIdle() works correctly.
+    // Static init leaves them at 0, but INVALID is 0xFFFFFFFF.
+    spiDcpt.transferTxHandle = DRV_SPI_TRANSFER_HANDLE_INVALID;
+    spiDcpt.transferRxHandle = DRV_SPI_TRANSFER_HANDLE_INVALID;
 
     if (DRV_HANDLE_INVALID == spiDcpt.spiHandle)
     {
