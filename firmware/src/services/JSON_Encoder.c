@@ -15,6 +15,7 @@
 #include "JSON_Encoder.h"
 #include "../HAL/ADC.h"
 #include "../HAL/TimerApi/TimerApi.h"
+#include "streaming.h"
 
 #ifndef min
 #define min(x,y) x <= y ? x : y
@@ -406,8 +407,8 @@ size_t Json_Encode(tBoardData* state,
 
         uint32_t qSize = AInSampleList_Size();
         AInPublicSampleList_t *pPublicSampleList;
+        const AInChannelMapping* mapping = Streaming_GetChannelMapping();
         while (((buffSize - startIndex) >= 65) && (qSize > 0)) {
-            AInSample data;
             if (!AInSampleList_PopFront(&pPublicSampleList)) {
                 break;
             }
@@ -415,11 +416,23 @@ size_t Json_Encode(tBoardData* state,
                 break;
             qSize--;
             bool timestampAdded = false;
-            for (int i = 0; i < MAX_AIN_PUBLIC_CHANNELS; i++) {
-                if (!pPublicSampleList->isSampleValid[i])
+            // Clamp to the sample's own channelCount in case the mapping and
+            // the sample fall out of sync. Defensive — they should always
+            // match. Matches the CSV / NanoPB encoder pattern.
+            uint8_t n = mapping->count;
+            if (pPublicSampleList->channelCount < n) {
+                n = (uint8_t)pPublicSampleList->channelCount;
+            }
+            for (uint8_t j = 0; j < n; j++) {
+                if (!(pPublicSampleList->validMask & (1U << j)))
                     continue;
 
-                 data = pPublicSampleList->sampleElement[i];
+                // Build temporary AInSample for ADC_ConvertToVoltage
+                AInSample data = {
+                    .Timestamp = pPublicSampleList->Timestamp,
+                    .Channel = mapping->channelIds[j],
+                    .Value = pPublicSampleList->Values[j]
+                };
                 if (!timestampAdded) {
                     int written = snprintf(charBuffer + startIndex,
                             buffSize - startIndex,
@@ -466,7 +479,7 @@ size_t Json_Encode(tBoardData* state,
                 startIndex += written;
             }
 
-            AInSampleList_FreeToPool(pPublicSampleList);  // Use pool instead of vPortFree
+            AInSampleList_FreeToPool(pPublicSampleList);
             if(startIndex == initialOffsetIndex) //no adc data added
                 break;
             // Remove trailing comma and close adc array

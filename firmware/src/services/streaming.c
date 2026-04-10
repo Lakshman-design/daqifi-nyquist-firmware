@@ -151,6 +151,18 @@ static const NanopbFlagsArray fields_sd_metadata = {
 #define max(x,y) ((x) >= (y) ? (x) : (y))
 #endif // max
 
+// --- Channel mapping for compact sample pool (#177) ---
+// Built at stream start, maps packed array indices to board config channels.
+// Used by deferred ISR task (sample population) and all encoders.
+//
+// Concurrency: Streaming_BuildChannelMapping() is always called before
+// pRunTimeStreamConf->IsEnabled is set to true and before the timer ISR starts
+// (see SCPI_StartStreaming: BuildChannelMapping → ... → IsEnabled=true →
+// Streaming_UpdateState). The deferred ISR task guards all gChannelMapping
+// reads behind the IsEnabled check, so the mapping is fully written before
+// any reader sees it. On PIC32MZ single-core, no memory barriers are needed.
+static AInChannelMapping gChannelMapping = {0};
+
 // Encoder buffer — allocated from StreamingBufferPool, runtime-adjustable.
 // ENCODER_BUFFER_DEFAULT (8192) and ENCODER_BUFFER_MIN (1024) defined in
 // StreamingBufferPool.h. Benchmark: 8KB optimal for USB, 16KB helps SD.
@@ -213,6 +225,32 @@ static uint32_t Streaming_GenerateTestValue(uint32_t pattern, uint8_t channel,
     }
 }
 
+// --- Channel mapping API ---
+
+uint8_t Streaming_BuildChannelMapping(const tBoardConfig* pBoardConfig,
+                                       const AInRuntimeArray* pRuntimeChannels) {
+    memset(&gChannelMapping, 0, sizeof(gChannelMapping));
+
+    size_t count = pBoardConfig->AInChannels.Size < pRuntimeChannels->Size
+                 ? pBoardConfig->AInChannels.Size : pRuntimeChannels->Size;
+
+    uint8_t packed = 0;
+    for (size_t i = 0; i < count && packed < MAX_AIN_PUBLIC_CHANNELS; i++) {
+        if (pRuntimeChannels->Data[i].IsEnabled &&
+            AInChannel_IsPublic(&pBoardConfig->AInChannels.Data[i])) {
+            gChannelMapping.channelIds[packed] = pBoardConfig->AInChannels.Data[i].DaqifiAdcChannelId;
+            gChannelMapping.configIndices[packed] = (uint8_t)i;
+            packed++;
+        }
+    }
+    gChannelMapping.count = packed;
+    return packed;
+}
+
+const AInChannelMapping* Streaming_GetChannelMapping(void) {
+    return &gChannelMapping;
+}
+
 /**
  * @brief Deferred interrupt handler for sample collection.
  *
@@ -243,7 +281,6 @@ void _Streaming_Deferred_Interrupt_Task(void) {
 
     AInModRuntimeArray * pRunTimeAInModules = BoardRunTimeConfig_Get(
             BOARDRUNTIMECONFIG_AIN_MODULES);
-    AInRuntimeArray* pAiRunTimeChannelConfig = BoardRunTimeConfig_Get(BOARDRUNTIMECONFIG_AIN_CHANNELS);
 
     AInPublicSampleList_t *pPublicSampleList=NULL;
     AInSample *pAiSample;
@@ -268,50 +305,79 @@ void _Streaming_Deferred_Interrupt_Task(void) {
                 }
                 continue;
             }
-            for (i = 0; i < pAiRunTimeChannelConfig->Size; i++) {
-                if (pAiRunTimeChannelConfig->Data[i].IsEnabled == 1
-                        && AInChannel_IsPublic(&pBoardConfig->AInChannels.Data[i])) {
 
-                    uint32_t adcMax;
-                    if (pBoardConfig->AInChannels.Data[i].Type == AIn_AD7609) {
-                        adcMax = (uint32_t)pBoardConfig->AInModules.Data[1].Config.AD7609.Resolution - 1;
-                    } else {
-                        adcMax = (uint32_t)pBoardConfig->AInModules.Data[0].Config.MC12b.Resolution - 1;
+            // Fill packed sample using channel mapping (#177).
+            // Mapping was built at stream start; packed index j maps to
+            // board config index via gChannelMapping.configIndices[j].
+            const AInChannelMapping* mapping = &gChannelMapping;
+            pPublicSampleList->channelCount = mapping->count;
+            pPublicSampleList->validMask = 0;
+            pPublicSampleList->Timestamp = 0;
+
+            for (uint8_t j = 0; j < mapping->count; j++) {
+                uint8_t cfgIdx = mapping->configIndices[j];
+
+                uint32_t adcMax;
+                if (pBoardConfig->AInChannels.Data[cfgIdx].Type == AIn_AD7609) {
+                    adcMax = (uint32_t)pBoardConfig->AInModules.Data[1].Config.AD7609.Resolution - 1;
+                } else {
+                    adcMax = (uint32_t)pBoardConfig->AInModules.Data[0].Config.MC12b.Resolution - 1;
+                }
+
+                if (gBenchmarkMode == BENCHMARK_PIPELINE) {
+                    // Pipeline: skip ADC entirely, generate synthetic data directly.
+                    // Timestamp comes from the streaming timer tick captured by
+                    // Streaming_TimerHandler (BOARDDATA_STREAMING_TIMESTAMP) — same
+                    // source the ADC ISR uses for AInSample.Timestamp in normal
+                    // operation, so PB/CSV/JSON output is consistent across modes.
+                    pPublicSampleList->Values[j] =
+                        Streaming_GenerateTestValue(gTestPattern,
+                            mapping->channelIds[j],
+                            gTestPatternSampleCount, adcMax);
+                    pPublicSampleList->validMask |= (1U << j);
+                } else if (gTestPattern != 0) {
+                    // Test pattern: always produce deterministic data regardless
+                    // of ADC state. Read ADC for timestamp only.
+                    pAiSample = BoardData_Get(BOARDDATA_AIN_LATEST, cfgIdx);
+                    if (pAiSample != NULL && pPublicSampleList->Timestamp == 0) {
+                        pPublicSampleList->Timestamp = pAiSample->Timestamp;
                     }
+                    pPublicSampleList->Values[j] =
+                        Streaming_GenerateTestValue(gTestPattern,
+                            mapping->channelIds[j],
+                            gTestPatternSampleCount, adcMax);
+                    pPublicSampleList->validMask |= (1U << j);
+                } else {
+                    // Normal: read real ADC data from BoardData
+                    pAiSample = BoardData_Get(BOARDDATA_AIN_LATEST, cfgIdx);
+                    if (pAiSample != NULL) {
+                        taskENTER_CRITICAL();
+                        uint32_t ts = pAiSample->Timestamp;
+                        uint32_t val = pAiSample->Value;
+                        taskEXIT_CRITICAL();
 
-                    pPublicSampleList->sampleElement[i].Channel =
-                        pBoardConfig->AInChannels.Data[i].DaqifiAdcChannelId;
-
-                    if (gBenchmarkMode == BENCHMARK_PIPELINE) {
-                        // Pipeline: skip ADC entirely, generate synthetic data directly.
-                        // No BoardData read, no ADC wait — measures pure encoder + output.
-                        pPublicSampleList->sampleElement[i].Timestamp = 0;
-                        pPublicSampleList->sampleElement[i].Value =
-                            Streaming_GenerateTestValue(gTestPattern,
-                                pPublicSampleList->sampleElement[i].Channel,
-                                gTestPatternSampleCount, adcMax);
-                        pPublicSampleList->isSampleValid[i] = 1;
-                    } else {
-                        // Normal/NoCap: read real ADC data from BoardData
-                        pAiSample = BoardData_Get(BOARDDATA_AIN_LATEST, i);
-                        if (pAiSample != NULL) {
-                            taskENTER_CRITICAL();
-                            pPublicSampleList->sampleElement[i].Timestamp = pAiSample->Timestamp;
-                            pPublicSampleList->sampleElement[i].Value = pAiSample->Value;
-                            taskEXIT_CRITICAL();
-                            pPublicSampleList->isSampleValid[i] = 1;
-
-                            // Test pattern override (if enabled)
-                            if (gTestPattern != 0) {
-                                pPublicSampleList->sampleElement[i].Value =
-                                    Streaming_GenerateTestValue(gTestPattern,
-                                        pPublicSampleList->sampleElement[i].Channel,
-                                        gTestPatternSampleCount, adcMax);
-                            }
-                        } else {
-                            pPublicSampleList->isSampleValid[i] = 0;
+                        pPublicSampleList->Values[j] = val;
+                        pPublicSampleList->validMask |= (1U << j);
+                        if (pPublicSampleList->Timestamp == 0) {
+                            pPublicSampleList->Timestamp = ts;
                         }
                     }
+                    // else: bit stays 0 in validMask (invalid)
+                }
+            }
+
+            // Guarantee a non-zero timestamp on every emitted packet. Pipeline
+            // mode never reads ADC samples; normal/test-pattern modes may also
+            // end up with Timestamp=0 in edge cases (DIO-only streaming, or
+            // all AIN channels happen to be invalid this cycle). Fall back to
+            // the streaming timer tick captured by Streaming_TimerHandler —
+            // same source the ADC ISR writes to AInSample.Timestamp, so the
+            // wire output remains consistent across modes. Required because
+            // the PB encoder omits the msg_time_stamp field when timestamp==0.
+            if (pPublicSampleList->Timestamp == 0) {
+                uint32_t* pTrigStamp = BoardData_Get(BOARDDATA_STREAMING_TIMESTAMP, 0);
+                if (pTrigStamp != NULL) {
+                    pPublicSampleList->Timestamp = *pTrigStamp;
                 }
             }
             if(!AInSampleList_PushBack(pPublicSampleList)){//failed pushing to Q
@@ -1149,162 +1215,3 @@ uint32_t Streaming_GetBenchmarkMode(void) {
     return gBenchmarkMode;
 }
 
-// Removed: Streaming_RunBenchmark — replaced by benchmark mode flag.
-// The deferred ISR task checks gBenchmarkMode and skips ulTaskNotifyTake
-// when enabled, generating samples as fast as the pipeline can consume them.
-// This uses the existing streaming infrastructure (stats, pool, encoder,
-// output buffers) without any special code paths.
-#if 0  // Reference: old standalone benchmark function
-    if (result == NULL || durationSec == 0 || durationSec > 60) return false;
-
-    StreamingRuntimeConfig* pStreamCfg = BoardRunTimeConfig_Get(
-            BOARDRUNTIME_STREAMING_CONFIGURATION);
-    if (pStreamCfg->Running || pStreamCfg->IsEnabled) {
-        LOG_E("Benchmark rejected: streaming is active");
-        return false;
-    }
-
-    tBoardData* pBoardData = BoardData_Get(BOARDDATA_ALL_DATA, 0);
-    tBoardConfig* pBoardConfig = BoardConfig_Get(BOARDCONFIG_ALL_CONFIG, 0);
-    AInRuntimeArray* pAiChannels = BoardRunTimeConfig_Get(BOARDRUNTIMECONFIG_AIN_CHANNELS);
-
-    memset(result, 0, sizeof(StreamingBenchmarkResult));
-
-    // Generate a fake sample with all enabled channels
-    AInPublicSampleList_t fakeSample;
-    memset(&fakeSample, 0, sizeof(fakeSample));
-    uint32_t sampleCounter = 0;
-
-    for (uint8_t i = 0; i < pAiChannels->Size; i++) {
-        if (pAiChannels->Data[i].IsEnabled &&
-            AInChannel_IsPublic(&pBoardConfig->AInChannels.Data[i])) {
-            fakeSample.sampleElement[i].Channel =
-                pBoardConfig->AInChannels.Data[i].DaqifiAdcChannelId;
-            fakeSample.sampleElement[i].Timestamp = 0;
-            fakeSample.sampleElement[i].Value = 2048;  // Midscale
-            fakeSample.isSampleValid[i] = true;
-        }
-    }
-
-    // Temporarily set encoding and interface for the benchmark
-    StreamingEncoding savedEncoding = pStreamCfg->Encoding;
-    StreamingInterface savedInterface = pStreamCfg->ActiveInterface;
-    pStreamCfg->Encoding = (StreamingEncoding)encoding;
-    pStreamCfg->ActiveInterface = (StreamingInterface)interface;
-
-    // Setup flags for encoder
-    NanopbFlagsArray nanopbFlag;
-    nanopbFlag.Size = 0;
-    nanopbFlag.Data[nanopbFlag.Size++] = DaqifiOutMessage_msg_time_stamp_tag;
-    nanopbFlag.Data[nanopbFlag.Size++] = DaqifiOutMessage_analog_in_data_tag;
-
-    // Init encoders (CSV/JSON need header state)
-    if (encoding == Streaming_Csv) {
-        csv_Init();
-    } else if (encoding == Streaming_Json) {
-        json_Init();
-    }
-
-    uint64_t totalBytes = 0;
-    uint32_t totalSamples = 0;
-    uint32_t outputDrops = 0;
-    uint32_t encFails = 0;
-
-    LOG_I("Benchmark: %us, interface=%u, encoding=%u",
-          (unsigned)durationSec, (unsigned)interface, (unsigned)encoding);
-
-    TickType_t startTick = xTaskGetTickCount();
-    TickType_t endTick = startTick + pdMS_TO_TICKS(durationSec * 1000);
-
-    // Tight loop: encode and output as fast as possible
-    while (xTaskGetTickCount() < endTick) {
-        // Update fake timestamp
-        fakeSample.sampleElement[0].Timestamp = xTaskGetTickCount();
-        sampleCounter++;
-
-        // Push fake sample to the queue (so encoder can pop it)
-        AInSampleList_PushBack(&fakeSample);
-
-        // Check output buffer space
-        size_t outSize = 0;
-        switch (interface) {
-            case 0: outSize = UsbCdc_WriteBuffFreeSize(NULL); break;
-            case 1: outSize = wifi_manager_GetWriteBuffFreeSize(); break;
-            case 2: outSize = sd_card_manager_IsWriteReady()
-                             ? sd_card_manager_GetWriteBuffFreeSize() : 0; break;
-        }
-
-        if (outSize < 128) {
-            // Output buffer full — yield to let it drain
-            AInPublicSampleList_t* pDiscard;
-            AInSampleList_PopFront(&pDiscard);  // Remove our sample
-            vTaskDelay(1);
-            continue;
-        }
-
-        // Encode
-        size_t maxEncode = (outSize > bufferSize) ? bufferSize : outSize;
-        size_t packetSize = 0;
-
-        if (encoding == Streaming_Csv) {
-            packetSize = csv_Encode(pBoardData, &nanopbFlag, (uint8_t*)buffer, maxEncode);
-        } else if (encoding == Streaming_Json) {
-            packetSize = Json_Encode(pBoardData, &nanopbFlag, (uint8_t*)buffer, maxEncode);
-        } else {
-            packetSize = Nanopb_EncodeStreamingFast(pBoardData, &nanopbFlag, (uint8_t*)buffer, maxEncode);
-        }
-
-        if (packetSize == 0) {
-            encFails++;
-            // Still need to pop the sample we pushed
-            AInPublicSampleList_t* pDiscard;
-            AInSampleList_PopFront(&pDiscard);
-            continue;
-        }
-
-        totalBytes += packetSize;
-        totalSamples++;
-
-        // Write to output with adaptive retry
-        {
-            StreamWriteFn fn = NULL;
-            switch (interface) {
-                case 0: fn = Streaming_UsbWrite; break;
-                case 1: fn = wifi_manager_WriteToBuffer; break;
-                case 2: fn = sd_card_manager_WriteToBuffer; break;
-            }
-            size_t total_written = fn ? Streaming_WriteWithRetry(fn, (const uint8_t*)buffer, packetSize) : 0;
-
-            if (total_written < packetSize) {
-                outputDrops += (packetSize - total_written);
-            }
-        }
-
-        // Yield periodically to let output tasks drain
-        if ((sampleCounter % 100) == 0) {
-            vTaskDelay(1);
-        }
-    }
-
-    uint32_t elapsed = pdTICKS_TO_MS(xTaskGetTickCount() - startTick);
-
-    // Restore streaming config
-    pStreamCfg->Encoding = savedEncoding;
-    pStreamCfg->ActiveInterface = savedInterface;
-
-    // Fill result
-    result->durationMs = elapsed;
-    result->totalBytes = totalBytes;
-    result->totalSamples = totalSamples;
-    result->bytesPerSec = (elapsed > 0) ? (uint32_t)((totalBytes * 1000ULL) / elapsed) : 0;
-    result->samplesPerSec = (elapsed > 0) ? (totalSamples * 1000) / elapsed : 0;
-    result->outputDrops = outputDrops;
-    result->encoderFailures = encFails;
-
-    LOG_I("Benchmark done: %u bytes in %ums = %u bytes/sec, %u samples/sec",
-          (unsigned)totalBytes, (unsigned)elapsed,
-          (unsigned)result->bytesPerSec, (unsigned)result->samplesPerSec);
-
-    return true;
-}
-#endif  // Reference: old standalone benchmark function

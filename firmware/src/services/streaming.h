@@ -3,6 +3,7 @@
 #include "../state/board/BoardConfig.h"
 #include "../state/runtime/BoardRuntimeConfig.h"
 #include "../state/data/BoardData.h"
+#include "../state/data/AInSample.h"
 
 
 #ifdef	__cplusplus
@@ -36,7 +37,13 @@ extern "C" {
 // Benchmark mode levels (extensible — add new values for future modes)
 #define BENCHMARK_OFF      0   // Normal: freq cap active, real ADC
 #define BENCHMARK_NOCAP    1   // Bypass freq cap, real ADC timing
-#define BENCHMARK_PIPELINE 2   // Bypass freq cap + skip ADC entirely
+#define BENCHMARK_PIPELINE 2   // Bypass freq cap + skip ADC entirely. Sample
+                               // values are generated directly without touching
+                               // ADC hardware (uses current test pattern; if
+                               // pattern=0 then values will be 0). Timestamp
+                               // comes from the streaming timer tick (same
+                               // source as normal-mode AInSample timestamps),
+                               // so output remains comparable across modes.
 
 #define STREAMING_ISR_MAX_HZ        11000
 #define STREAMING_TYPE1_AGG_MAX_HZ  30000
@@ -191,6 +198,24 @@ uint32_t Streaming_GetTestPattern(void);
 //   2 = Pipeline (bypass cap + skip ADC, test pattern required)
 void Streaming_SetBenchmarkMode(uint32_t mode);
 uint32_t Streaming_GetBenchmarkMode(void);
+
+/**
+ * Build channel mapping from current board config and runtime config.
+ * Must be called before streaming starts (from SCPI_StartStreaming).
+ * Stores mapping globally for ISR and encoder access.
+ *
+ * @param pBoardConfig     Board hardware configuration
+ * @param pRuntimeChannels Runtime channel enable/disable state
+ * @return Number of enabled public channels (mapping.count)
+ */
+uint8_t Streaming_BuildChannelMapping(const tBoardConfig* pBoardConfig,
+                                       const AInRuntimeArray* pRuntimeChannels);
+
+/**
+ * Get the current channel mapping (built at stream start).
+ * Valid only while streaming is active or after BuildChannelMapping.
+ */
+const AInChannelMapping* Streaming_GetChannelMapping(void);
 
 #ifdef	__cplusplus
 }
