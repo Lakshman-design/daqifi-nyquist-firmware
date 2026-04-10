@@ -509,14 +509,9 @@ bool AD7609_TriggerConversion(const AD7609ModuleConfig* moduleConfig)
 
 double AD7609_ConvertToVoltage(
                         const AInRuntimeConfig* runtimeConfig,
-                        const AInSample* sample)
+                        uint32_t rawValue)
 {
     UNUSED(runtimeConfig);
-
-    if (sample == NULL) {
-        LOG_E("AD7609_ConvertToVoltage: NULL sample");
-        return 0.0;
-    }
 
     // Get runtime range from module configuration using BoardRunTimeConfig_Get
     AInModRuntimeArray* pRuntimeModules = BoardRunTimeConfig_Get(BOARDRUNTIMECONFIG_AIN_MODULES);
@@ -527,19 +522,30 @@ double AD7609_ConvertToVoltage(
         fullScaleVoltage = pRuntimeModules->Data[AIn_AD7609].Range;
     }
 
-    // AD7609 is 18-bit, 2's complement
-    const int32_t maxCode = (AD7609_MAX_VALUE >> 1); // Half scale for signed 18-bit (131071)
+    // AD7609 is 18-bit, 2's complement: range -131072 to +131071.
+    // AD7609_MAX_VALUE (0x1FFFF = 131071) is the max positive code.
+    // Bug fix: was using MAX_VALUE >> 1 (65535) which doubled all voltages.
+    // TODO: Verify this scaling against a known reference voltage on NQ3
+    // hardware. The original >> 1 may have been compensating for a different
+    // issue (e.g., bipolar vs unipolar range interpretation, or a mismatch
+    // between fullScaleVoltage and the AD7609's actual configured range).
+    // Consult the AD7609 datasheet Table 7 (output coding) and verify with
+    // a precision voltage source before shipping this change on NQ3.
+    const int32_t maxCode = AD7609_MAX_VALUE;  // 131071 = 2^17 - 1
 
-    // Convert raw ADC value to signed integer
-    int32_t rawValue = (int32_t)sample->Value;
+    // Mask to 18-bit width before sign extension. Defensive: upstream should
+    // only pass 18-bit values, but if upper bits are set (e.g., from a wider
+    // register read or buffered value), they would corrupt the sign logic.
+    // 0x3FFFF = bits [17:0] = AD7609_MAX_VALUE | AD7609_SIGN_BIT
+    int32_t signedValue = (int32_t)(rawValue & (AD7609_MAX_VALUE | AD7609_SIGN_BIT));
 
     // Handle 18-bit 2's complement conversion by checking sign bit
     // If bit 17 is set, the value is negative and needs sign extension
-    if (rawValue & AD7609_SIGN_BIT) {
-        rawValue |= AD7609_SIGN_EXTEND;  // Sign extend from 18 bits to 32 bits
+    if (signedValue & AD7609_SIGN_BIT) {
+        signedValue |= AD7609_SIGN_EXTEND;  // Sign extend from 18 bits to 32 bits
     }
 
     // Convert to voltage: raw / maxCode * fullScale
-    double voltage = ((double)rawValue / (double)maxCode) * fullScaleVoltage;
+    double voltage = ((double)signedValue / (double)maxCode) * fullScaleVoltage;
     return voltage;
 }
