@@ -166,8 +166,13 @@ static AInChannelMapping gChannelMapping = {0};
 // Encoder buffer — allocated from StreamingBufferPool, runtime-adjustable.
 // ENCODER_BUFFER_DEFAULT (8192) and ENCODER_BUFFER_MIN (1024) defined in
 // StreamingBufferPool.h. Benchmark: 8KB optimal for USB, 16KB helps SD.
-static uint8_t* buffer = NULL;
-static uint32_t bufferSize = 0;
+//
+// volatile: written by SCPI/USB task during StartStreamData (streaming is
+// stopped, so no torn-read risk — the streaming task is blocked on
+// ulTaskNotifyTake). Without volatile, -O2+ caches these in registers
+// across the while(1) loop since their addresses are never taken.
+static uint8_t* volatile buffer = NULL;
+static volatile uint32_t bufferSize = 0;
 
 //! Pointer to the board configuration data structure to be set in 
 //! initialization
@@ -286,6 +291,7 @@ void _Streaming_Deferred_Interrupt_Task(void) {
     AInSample *pAiSample;
 
     uint64_t ChannelScanFreqDivCount = 0;
+
     while (1) {
         ulTaskNotifyTake(pdFALSE, xBlockTime);
 
