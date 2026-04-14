@@ -247,15 +247,19 @@ The PIC32MZ ADCHS peripheral has two types of ADC channels with different ISR st
 - `HAL/ADC/MC12bADC.c` — `MC12b_TriggerConversion`, `MC12b_WriteStateAll` (batch interrupt setup)
 - `HAL/ADC.c` — `MC12bADC_EosInterruptTask`, `ADC_ReadADCSampleFromISR`
 
-**Characterization results (O3, USB PB, zero-loss ceiling):**
+**Characterization results (O3, USB, zero-loss ceiling, 2026-04-13):**
 
-| Config | Ceiling Hz | Notes |
-|--------|-----------|-------|
-| 1×T1 | ~15,000 | Single dedicated module |
-| 5×T1 | ~11,000 | All 5 simultaneous (batched ISR) |
-| 1×T2 | ~16,800 | Single mux channel |
-| 11×T2 | ~11,400 | Full mux scan |
-| 5T1+11T2 (16ch) | ~6,400 | Both ADC paths active |
+| Config | PB Ceiling | PB KB/s | CSV Ceiling | CSV KB/s |
+|--------|----------:|--------:|------------:|--------:|
+| 1×T1 | 13,800 Hz | 147 | 13,800 Hz | 217 |
+| 3×T1 | 12,200 Hz | 180 | 11,400 Hz | 543 |
+| 5×T1 | 11,000 Hz | 212 | 9,600 Hz | 755 |
+| 1×T2 | 16,200 Hz | 171 | 16,200 Hz | 255 |
+| 4×T2 | 12,800 Hz | 214 | 12,600 Hz | 771 |
+| 8×T2 | 12,200 Hz | 297 | 9,600 Hz | 1,160 |
+| 11×T2 | 11,000 Hz | 335 | 6,400 Hz | 1,125 |
+| 5T1+4T2 (9ch) | 10,000 Hz | 262 | 7,800 Hz | 1,077 |
+| 5T1+11T2 (16ch) | 6,400 Hz | 263 | 6,000 Hz | 1,464 |
 
 #### Voltage Output Precision
 
@@ -378,22 +382,23 @@ SYSTem:STReam:LOSS:WINDow?           # Query current override (0=auto)
 
 The firmware automatically caps the requested streaming frequency based on a three-constraint model validated against hardware benchmarks. The cap is applied silently — no SCPI error is returned, but a `LOG_I` message is written to the log buffer (retrievable via `SYST:LOG?`).
 
-**Constraints:**
+**Constraints (fitted to characterization data 2026-04-13):**
 | Constraint | Limit | Formula |
 |-----------|-------|---------|
-| ISR ceiling | 11 kHz | Hard per-invocation overhead limit |
-| Type 1 aggregate | 30 kHz total | `30000 / type1ChannelCount` |
-| Per-tick budget | Scales with channels | `77000 / (6 + totalEnabledChannels)` |
+| ISR ceiling | 13 kHz | Hard per-invocation overhead limit |
+| Type 1 aggregate | 55 kHz total | `55000 / type1ChannelCount` (batched ISR) |
+| Per-tick budget | Scales with channels | `110000 / (6 + totalEnabledChannels)` |
 
 **Effective limit:** `min(ISR_MAX, TYPE1_AGG / type1Count, BUDGET / (OVERHEAD + totalEnabled))`
 
-**Example caps (all Type 1 channels):**
-| Channels | Max Frequency |
-|----------|--------------|
-| 1 | 11,000 Hz |
-| 5 | 6,000 Hz |
-| 8 | 5,500 Hz |
-| 16 | 3,500 Hz |
+**Example caps vs measured ceilings:**
+| Config | Cap | Measured | Utilization |
+|--------|----:|--------:|-----------:|
+| 1×T1 | 13,000 Hz | 13,800 Hz | 94% |
+| 5×T1 | 10,000 Hz | 11,000 Hz | 91% |
+| 1×T2 | 13,000 Hz | 16,200 Hz | 80% |
+| 5T1+4T2 (9ch) | 7,333 Hz | 10,000 Hz | 73% |
+| 16ch | 5,000 Hz | 6,400 Hz | 78% |
 
 **Where capping is applied:**
 - `SYSTem:StartStreamData <freq>` — caps frequency before starting the timer
@@ -471,15 +476,16 @@ SYSTem:STORage:SD:BENCHmark <size_kb>,<pattern>  # Run (e.g., 1024,0)
 SYSTem:STORage:SD:BENCHmark?                      # Query results: bytes,ms,bps
 ```
 
-**Measured Throughput Ceilings (NQ1, test patterns):**
+**Measured Throughput Ceilings (NQ1, test patterns, 2026-04-13):**
 
 | Interface | Format | Channels | Max Zero-Loss Rate | KB/s |
 |-----------|--------|----------|------------------:|-----:|
-| USB | CSV | 1 | 15 kHz | 239 |
-| USB | CSV | 16 | 5 kHz | 720 |
-| USB | PB | 1 | 15 kHz | 51 |
-| USB | PB | 8 | 11 kHz | 195 |
-| USB | PB | 16 | 7 kHz | 211 |
+| USB | PB | 1 | 16,200 Hz | 168 |
+| USB | PB | 8 | 10,800 Hz | 259 |
+| USB | PB | 16 | 8,200 Hz | 336 |
+| USB | CSV | 1 | 16,200 Hz | 247 |
+| USB | CSV | 8 | 8,600 Hz | 999 |
+| USB | CSV | 16 | 6,000 Hz | 1,418 |
 | SD | CSV | 1 | 11 kHz | 172 |
 | SD | CSV | 8 | 3 kHz | 408 |
 | SD | CSV | 16 | 2 kHz | 546 |
@@ -490,8 +496,7 @@ SYSTem:STORage:SD:BENCHmark?                      # Query results: bytes,ms,bps
 | WiFi | CSV | 16 | 1 kHz | 206 |
 | SD | raw write | — | — | 665 |
 
-**Benchmark variance:** USB throughput measurements show ~10-15% run-to-run variance (e.g., USB CSV 1ch@5kHz: 4739-5423 sps across 3 consecutive runs). Root cause unknown — likely USB CDC transfer scheduling, WSL USB passthrough jitter, or FreeRTOS task timing. Ceilings in the table above represent the highest zero-loss rate observed across multiple runs. When comparing benchmarks, run at least 3 times and use the average.
-
+**Benchmark variance:** With the improved SPS measurement methodology (blocking FastReader, sleep-duration denominator), run-to-run variance is near zero for identical firmware. Previous ~10-15% variance was caused by unreliable first-byte-time SPS calculation.
 
 Update this table when new benchmark results are collected. Full benchmark history is version-controlled in `daqifi-python-test-suite/benchmarks/` (CSV files + CHANGELOG.md). Run `python test_throughput_benchmark.py <port> <duration>` and copy the output CSV to that directory.
 

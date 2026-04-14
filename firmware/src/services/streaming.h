@@ -45,9 +45,11 @@ extern "C" {
                                // source as normal-mode AInSample timestamps),
                                // so output remains comparable across modes.
 
-#define STREAMING_ISR_MAX_HZ        11000
-#define STREAMING_TYPE1_AGG_MAX_HZ  30000
-#define STREAMING_TICK_BUDGET       77000
+// Frequency cap constants — fitted to characterization data (2026-04-13).
+// ISR batching (#277) reduced Type 1 overhead; refit with updated ceilings.
+#define STREAMING_ISR_MAX_HZ        13000
+#define STREAMING_TYPE1_AGG_MAX_HZ  55000
+#define STREAMING_TICK_BUDGET       110000
 #define STREAMING_TICK_OVERHEAD     6
 
 /**
