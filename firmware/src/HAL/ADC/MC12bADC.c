@@ -7,10 +7,9 @@
 #include "../DIO.h"
 #include "configuration.h"
 #include "definitions.h"
-//#include "system_config.h"
-//#include "framework/driver/adc/drv_adc_static.h"
 #include "Util/Delay.h"
 #include "state/data/BoardData.h"
+#include "state/board/BoardConfig.h"
 
 //#define UNUSED(x) (void)(x)
 #define UNUSED(identifier) /* identifier */
@@ -39,10 +38,38 @@ static AInModuleRuntimeConfig* gpModuleRuntimeConfigMC12;
 //! Boolean to indicate if this module is enabled
 static bool gIsEnabled = false;
 
+// --- Hardware trigger constants (DS60001320) ---
+// Trigger source encoding shared by per-channel TRGSRC (ADCTRGx) and
+// scan trigger STRGSRC (ADCCON1[20:16]).
+#define ADC_TRGSRC_TMR5             7       // Timer4/5 match (streaming timer)
+
+// ADCTRGx register layout: 4 channels per register, each TRGSRC field
+// is 5 bits wide at byte-aligned positions.
+//   ADCTRG(n) covers channels [(n-1)*4 .. (n-1)*4+3]
+//   Channel C → register index (C/4), bit shift (C%4)*8
+// Only channels 0-11 have per-channel TRGSRC fields (ADCTRG1-3).
+// Higher-numbered shared channels are scan-triggered via ADCCON1.STRGSRC.
+#define ADCTRG_REG_COUNT            3
+#define ADCTRG_CHANNELS_PER_REG     4
+#define ADCTRG_FIELD_MASK           0x1FU   // 5-bit trigger source field
+#define ADCCON1_STRGSRC_SHIFT       16      // STRGSRC is bits [20:16]
+
+// PLIB-initialized trigger register values, saved once in MC12b_InitHardware
+// (after ADCHS_Initialize). Restored when hardware triggering is disabled so
+// non-streaming ADC reads continue to work with MHC-configured trigger sources.
+static uint32_t gSavedADCTRG[ADCTRG_REG_COUNT];
+static uint32_t gSavedSTRGSRC;
+
 bool MC12b_InitHardware(MC12bModuleConfig* pModuleConfigInit,
         AInModuleRuntimeConfig * pModuleRuntimeConfigInit) {
     gpModuleConfigMC12 = pModuleConfigInit;
     gpModuleRuntimeConfigMC12 = pModuleRuntimeConfigInit;
+
+    // Save PLIB trigger defaults for restore after streaming
+    gSavedADCTRG[0] = ADCTRG1;
+    gSavedADCTRG[1] = ADCTRG2;
+    gSavedADCTRG[2] = ADCTRG3;
+    gSavedSTRGSRC = (ADCCON1 >> ADCCON1_STRGSRC_SHIFT) & ADCTRG_FIELD_MASK;
 
     // Copy factory calibration data to calibration registers
     ADC0CFG = DEVADC0;
@@ -221,4 +248,62 @@ bool MC12b_ReadResult(ADCHS_CHANNEL_NUM channel, uint32_t *pVal) {
     }
     *pVal = 0;
     return false;
+}
+
+/**
+ * Set a single channel's trigger source in ADCTRGx.
+ * @param trg   Working copy of ADCTRG[3] array (modified in-place)
+ * @param chId  ADCHS channel number (0-11 only)
+ * @param src   Trigger source value (0-31)
+ */
+static void SetChannelTrigSrc(uint32_t trg[ADCTRG_REG_COUNT],
+                              uint8_t chId, uint32_t src) {
+    uint8_t regIdx = chId / ADCTRG_CHANNELS_PER_REG;
+    if (regIdx >= ADCTRG_REG_COUNT) return;   // channels > 11 not in ADCTRG1-3
+    uint32_t shift = (chId % ADCTRG_CHANNELS_PER_REG) * 8;
+    trg[regIdx] &= ~(ADCTRG_FIELD_MASK << shift);
+    trg[regIdx] |= ((src & ADCTRG_FIELD_MASK) << shift);
+}
+
+void MC12b_ConfigureHardwareTrigger(bool hwDedicated, bool hwShared) {
+    const tBoardConfig* pCfg = (const tBoardConfig*)BoardConfig_Get(BOARDCONFIG_ALL_CONFIG, 0);
+
+    // Start from saved PLIB defaults, overlay hardware trigger sources
+    uint32_t trg[ADCTRG_REG_COUNT] = {
+        gSavedADCTRG[0], gSavedADCTRG[1], gSavedADCTRG[2]
+    };
+
+    if (hwDedicated) {
+        // Walk the board channel table — set TMR5 trigger for each Type 1
+        for (size_t i = 0; i < pCfg->AInChannels.Size; i++) {
+            const AInChannel* ch = &pCfg->AInChannels.Data[i];
+            if (ch->Type != AIn_MC12bADC) continue;
+            if (ch->Config.MC12b.ChannelType != 1) continue;
+            SetChannelTrigSrc(trg, ch->Config.MC12b.ChannelId, ADC_TRGSRC_TMR5);
+        }
+    }
+
+    ADCTRG1 = trg[0];
+    ADCTRG2 = trg[1];
+    ADCTRG3 = trg[2];
+
+    // MODULE7 scan trigger (ADCCON1.STRGSRC): controls when the shared
+    // module starts its multiplexed scan of all enabled shared channels.
+    uint32_t scanSrc = hwShared ? ADC_TRGSRC_TMR5 : gSavedSTRGSRC;
+    uint32_t con1 = ADCCON1;
+    con1 &= ~(ADCTRG_FIELD_MASK << ADCCON1_STRGSRC_SHIFT);
+    con1 |= (scanSrc << ADCCON1_STRGSRC_SHIFT);
+    ADCCON1 = con1;
+}
+
+// Query functions read SFR registers directly — the register value IS
+// the authoritative state.  No shadow variables needed.
+bool MC12b_IsHwTriggerDedicated(void) {
+    // Check first dedicated channel (AN0) — all Type 1 channels are set
+    // together so any one is representative.
+    return (ADCTRG1 & ADCTRG_FIELD_MASK) == ADC_TRGSRC_TMR5;
+}
+
+bool MC12b_IsHwTriggerShared(void) {
+    return ((ADCCON1 >> ADCCON1_STRGSRC_SHIFT) & ADCTRG_FIELD_MASK) == ADC_TRGSRC_TMR5;
 }
