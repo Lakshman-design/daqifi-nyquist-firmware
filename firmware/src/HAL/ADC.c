@@ -12,6 +12,8 @@
 #include "ADC/MC12bADC.h"
 #include "DIO.h"
 #include "Util/Logger.h"
+#include "FreeRTOS.h"
+#include "task.h"
 
 #define UNUSED(x) (void)(x)
 
@@ -23,6 +25,17 @@ static tBoardRuntimeConfig *gpBoardRuntimeConfig;
 // Pointer to the BoardData data structure, to be set in initialization
 static tBoardData* gpBoardData;
 static TaskHandle_t gADCInterruptHandle;
+
+// FreeRTOS tick count of the last successful monitoring channel read.
+// Updated only when MC12bADC_EosInterruptTask actually reads private
+// (non-public) channels.  Used by SCPI info commands to detect stale data.
+static volatile uint32_t gLastDiagScanTick = 0;
+
+// Mirrors the hardware EOS interrupt enable state so the deferred task
+// can skip its body when a pending notification drains after the ISR
+// has already been disabled. Without this, a single stale read can
+// refresh gLastDiagScanTick post-disable and delay the stale indicator.
+static volatile bool gEosInterruptEnabled = true;
 /*!
  * Retrieves the index of a module
  * @param[in] pModule Pointer to the module to search for
@@ -103,9 +116,18 @@ void MC12bADC_EosInterruptTask(void) {
 
     while (1) {
         ulTaskNotifyTake(pdFALSE, xBlockTime);
+
+        // Skip body if the EOS interrupt has been disabled since this
+        // notification was queued. Prevents a late read from refreshing
+        // gLastDiagScanTick after Streaming_Start suppressed diag scans.
+        if (!gEosInterruptEnabled) {
+            continue;
+        }
+
         AInSample sample;
         int i = 0;
         uint32_t adcval;
+        bool anyMonitorRead = false;
         uint32_t *valueTMR = (uint32_t*) BoardData_Get(BOARDDATA_STREAMING_TIMESTAMP, 0);
 
         // Ensure timestamp pointer is valid; use 0 as safe fallback
@@ -127,7 +149,15 @@ void MC12bADC_EosInterruptTask(void) {
                         BOARDDATA_AIN_LATEST,
                         i,
                         &sample);
+                anyMonitorRead = true;
             }
+        }
+
+        // Only update last-scan tick when we actually read monitoring data.
+        // This prevents stale-tick updates from spurious EOS wakeups
+        // (e.g., dedicated channel completions firing EOS).
+        if (anyMonitorRead) {
+            gLastDiagScanTick = xTaskGetTickCount();
         }
     }
 }
@@ -488,4 +518,30 @@ void ADC_EOSInterruptCB(uintptr_t context) {
         portEND_SWITCHING_ISR(xHigherPriorityTaskWoken);
     }
     // If task creation failed, interrupt still clears but no notification sent
+}
+
+uint32_t ADC_GetLastDiagScanTick(void) {
+    return gLastDiagScanTick;   // 32-bit read is atomic on PIC32MZ
+}
+
+void ADC_SetEosInterruptEnabled(bool enabled) {
+    // Update the software mirror first on disable (and last on enable) so
+    // the deferred task sees the flag state that matches the hardware at
+    // the moment of its next notification drain. Setting the flag true
+    // AFTER re-enabling hardware avoids a window where the task could
+    // unblock early and see gEosInterruptEnabled=true but no valid ADC
+    // results yet.
+    if (enabled) {
+        // Clear latched flag before re-enabling to prevent an immediate
+        // spurious fire from a flag set while the interrupt was disabled.
+        EVIC_SourceStatusClear(INT_SOURCE_ADC_EOS);
+        EVIC_SourceEnable(INT_SOURCE_ADC_EOS);
+        gEosInterruptEnabled = true;
+    } else {
+        gEosInterruptEnabled = false;
+        // Disable first, then clear pending flag to avoid a race where
+        // EOS re-asserts between clear and disable.
+        EVIC_SourceDisable(INT_SOURCE_ADC_EOS);
+        EVIC_SourceStatusClear(INT_SOURCE_ADC_EOS);
+    }
 }

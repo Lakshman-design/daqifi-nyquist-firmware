@@ -42,8 +42,27 @@ scpi_result_t SCPI_ADCVoltageGet(scpi_t * context) {
     if (SCPI_ParamInt32(context, &channel, FALSE)) {
         // Get single
         volatile double val = 0;
-        size_t index = ADC_FindChannelIndex((uint8_t) channel);
-        if (index > pBoardConfigAInChannels->Size) {
+        if (channel < 0 || channel > 255) {
+            SCPI_ErrorPush(context, SCPI_ERROR_DATA_OUT_OF_RANGE);
+            return SCPI_RES_ERR;
+        }
+        uint8_t ch = (uint8_t)channel;
+        size_t index = ADC_FindChannelIndex(ch);
+        if (index >= pBoardConfigAInChannels->Size) {
+            SCPI_ErrorPush(context, SCPI_ERROR_DATA_OUT_OF_RANGE);
+            return SCPI_RES_ERR;
+        }
+
+        // Monitoring channels (ID >= 248) are not being refreshed when
+        // OBDiag is disabled during active streaming — return an error so
+        // the user knows the reading would be stale/meaningless. Gate on
+        // Running (actual hardware state) rather than IsEnabled (user
+        // intent) so the guard lifts the instant Streaming_Stop re-enables
+        // the EOS interrupt, even if IsEnabled is still mid-reconfig.
+        if (ch >= ADC_CHANNEL_3_3V &&
+            pStreamCfg->Running && !pStreamCfg->OnboardDiagEnabled) {
+            LOG_E("MEAS:VOLT:DC? ch%d: monitoring disabled (OBDiag=0 during streaming)", (int)ch);
+            SCPI_ErrorPush(context, SCPI_ERROR_EXECUTION_ERROR);
             return SCPI_RES_ERR;
         }
 
@@ -685,7 +704,7 @@ scpi_result_t SCPI_ADCOnboardDiagSet(scpi_t * context) {
     }
     StreamingRuntimeConfig *pStreamCfg = BoardRunTimeConfig_Get(
             BOARDRUNTIME_STREAMING_CONFIGURATION);
-    if (pStreamCfg->Running) {
+    if (pStreamCfg->IsEnabled) {
         SCPI_ErrorPush(context, SCPI_ERROR_EXECUTION_ERROR);
         return SCPI_RES_ERR;
     }
