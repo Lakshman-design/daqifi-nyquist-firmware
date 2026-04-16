@@ -31,11 +31,6 @@ static TaskHandle_t gADCInterruptHandle;
 // (non-public) channels.  Used by SCPI info commands to detect stale data.
 static volatile uint32_t gLastDiagScanTick = 0;
 
-// Mirrors the hardware EOS interrupt enable state so the deferred task
-// can skip its body when a pending notification drains after the ISR
-// has already been disabled. Without this, a single stale read can
-// refresh gLastDiagScanTick post-disable and delay the stale indicator.
-static volatile bool gEosInterruptEnabled = true;
 /*!
  * Retrieves the index of a module
  * @param[in] pModule Pointer to the module to search for
@@ -110,52 +105,53 @@ void ADC_HandleAD7609Interrupt(void) {
     }
 }
 
-// Internal PIC32 ADC End-of-Scan interrupt task (MC12bADC only)
+// ADC EOS deferred task: reads T1 user channels + monitoring channels.
+//
+// #292: T1 (dedicated) result reads moved here from ADC_DATA3_Handler,
+// eliminating ~5μs ISR entry/exit overhead per streaming tick. T2 (shared)
+// user channels stay on their priority-1 ADC_DATAx ISRs — adding them
+// here would double-write AInLatest and regress T2 ceilings (confirmed
+// empirically). Monitoring gating: when streaming with OBDiag=0,
+// MODULE7 monitoring results are stale — skip those reads so
+// gLastDiagScanTick goes stale for SYST:INFo? reporting.
 void MC12bADC_EosInterruptTask(void) {
     const TickType_t xBlockTime = portMAX_DELAY;
 
     while (1) {
-        ulTaskNotifyTake(pdFALSE, xBlockTime);
-
-        // Skip body if the EOS interrupt has been disabled since this
-        // notification was queued. Prevents a late read from refreshing
-        // gLastDiagScanTick after Streaming_Start suppressed diag scans.
-        if (!gEosInterruptEnabled) {
-            continue;
-        }
+        ulTaskNotifyTake(pdTRUE, xBlockTime);
 
         AInSample sample;
         int i = 0;
         uint32_t adcval;
         bool anyMonitorRead = false;
         uint32_t *valueTMR = (uint32_t*) BoardData_Get(BOARDDATA_STREAMING_TIMESTAMP, 0);
-
-        // Ensure timestamp pointer is valid; use 0 as safe fallback
         uint32_t timestamp = (valueTMR != NULL) ? *valueTMR : 0;
 
-        // Read only the private internal ADC channels (MC12bADC)
-        // Note: AD7609 now uses interrupt-based reading via its own deferred task
+        bool streamingActive = gpBoardRuntimeConfig->StreamingConfig.Running;
+        bool diagScanning = !streamingActive ||
+                            gpBoardRuntimeConfig->StreamingConfig.OnboardDiagEnabled;
+
         for (i = 0; i < gpBoardConfig->AInChannels.Size; i++) {
-            if (gpBoardConfig->AInChannels.Data[i].Type == AIn_MC12bADC &&
-                gpBoardConfig->AInChannels.Data[i].Config.MC12b.IsPublic != 1
-                    && gpBoardRuntimeConfig->AInChannels.Data[i].IsEnabled == 1) {
-                if (!MC12b_ReadResult(gpBoardConfig->AInChannels.Data[i].Config.MC12b.ChannelId, &adcval)) {
-                    continue;
-                }
-                sample.Timestamp = timestamp;
-                sample.Channel = gpBoardConfig->AInChannels.Data[i].DaqifiAdcChannelId;
-                sample.Value = adcval;
-                BoardData_Set(
-                        BOARDDATA_AIN_LATEST,
-                        i,
-                        &sample);
-                anyMonitorRead = true;
-            }
+            const AInChannel* cfg = &gpBoardConfig->AInChannels.Data[i];
+            if (cfg->Type != AIn_MC12bADC) continue;
+            if (gpBoardRuntimeConfig->AInChannels.Data[i].IsEnabled != 1) continue;
+
+            bool isMonitoring = (cfg->Config.MC12b.IsPublic != 1);
+            bool isType1User = (!isMonitoring && cfg->Config.MC12b.ChannelType == 1);
+
+            if (isMonitoring && !diagScanning) continue;
+            if (!isMonitoring && !isType1User) continue; // T2 user → pri-1 ISRs
+
+            if (!MC12b_ReadResult(cfg->Config.MC12b.ChannelId, &adcval)) continue;
+
+            sample.Timestamp = timestamp;
+            sample.Channel = cfg->DaqifiAdcChannelId;
+            sample.Value = adcval;
+            BoardData_Set(BOARDDATA_AIN_LATEST, i, &sample);
+
+            if (isMonitoring) anyMonitorRead = true;
         }
 
-        // Only update last-scan tick when we actually read monitoring data.
-        // This prevents stale-tick updates from spurious EOS wakeups
-        // (e.g., dedicated channel completions firing EOS).
         if (anyMonitorRead) {
             gLastDiagScanTick = xTaskGetTickCount();
         }
@@ -524,24 +520,3 @@ uint32_t ADC_GetLastDiagScanTick(void) {
     return gLastDiagScanTick;   // 32-bit read is atomic on PIC32MZ
 }
 
-void ADC_SetEosInterruptEnabled(bool enabled) {
-    // Update the software mirror first on disable (and last on enable) so
-    // the deferred task sees the flag state that matches the hardware at
-    // the moment of its next notification drain. Setting the flag true
-    // AFTER re-enabling hardware avoids a window where the task could
-    // unblock early and see gEosInterruptEnabled=true but no valid ADC
-    // results yet.
-    if (enabled) {
-        // Clear latched flag before re-enabling to prevent an immediate
-        // spurious fire from a flag set while the interrupt was disabled.
-        EVIC_SourceStatusClear(INT_SOURCE_ADC_EOS);
-        EVIC_SourceEnable(INT_SOURCE_ADC_EOS);
-        gEosInterruptEnabled = true;
-    } else {
-        gEosInterruptEnabled = false;
-        // Disable first, then clear pending flag to avoid a race where
-        // EOS re-asserts between clear and disable.
-        EVIC_SourceDisable(INT_SOURCE_ADC_EOS);
-        EVIC_SourceStatusClear(INT_SOURCE_ADC_EOS);
-    }
-}
