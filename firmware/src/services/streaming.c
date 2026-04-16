@@ -747,7 +747,9 @@ static void Streaming_Stop(void) {
                         gStreamStats.usbDroppedBytes > 0 ||
                         gStreamStats.wifiDroppedBytes > 0 ||
                         gStreamStats.sdDroppedBytes > 0 ||
-                        gStreamStats.encoderFailures > 0;
+                        gStreamStats.encoderFailures > 0 ||
+                        gStreamStats.dioDroppedSamples > 0 ||
+                        gStreamStats.eosOverruns > 0;
         // Clear QUES condition bits so they don't persist after streaming ends.
         // Stats remain available via SYST:STR:STATS? until next session.
         gQuesBits = 0;  // 32-bit write is atomic on PIC32MZ
@@ -755,17 +757,25 @@ static void Streaming_Stop(void) {
         if (hadDrops) {
             uint64_t totalAttempted = gStreamStats.totalSamplesStreamed +
                                      gStreamStats.queueDroppedSamples;
+            // EOS coalescing is data staleness (ADC register overwrite),
+            // not a dropped sample — exclude from loss total/percentage.
+            uint32_t totalSampleLoss = gStreamStats.queueDroppedSamples +
+                                      gStreamStats.encoderDroppedSamples +
+                                      gStreamStats.dioDroppedSamples;
             uint32_t lossPercent = totalAttempted > 0
-                ? (uint32_t)((gStreamStats.queueDroppedSamples * 100ULL) / totalAttempted)
+                ? (uint32_t)((totalSampleLoss * 100ULL) / totalAttempted)
                 : 0;
-            LOG_E("Stream end: lost %u/%llu samples (%u%%), USB=%u WiFi=%u SD=%u bytes dropped, enc=%u",
-                  (unsigned)gStreamStats.queueDroppedSamples,
+            LOG_E("Stream end: lost %u/%llu samples (%u%%), USB=%u WiFi=%u SD=%u bytes, encFail=%u encDrop=%u dioDrop=%u eos=%u",
+                  (unsigned)totalSampleLoss,
                   (unsigned long long)totalAttempted,
                   (unsigned)lossPercent,
                   (unsigned)gStreamStats.usbDroppedBytes,
                   (unsigned)gStreamStats.wifiDroppedBytes,
                   (unsigned)gStreamStats.sdDroppedBytes,
-                  (unsigned)gStreamStats.encoderFailures);
+                  (unsigned)gStreamStats.encoderFailures,
+                  (unsigned)gStreamStats.encoderDroppedSamples,
+                  (unsigned)gStreamStats.dioDroppedSamples,
+                  (unsigned)gStreamStats.eosOverruns);
         }
     }
 }
@@ -926,6 +936,14 @@ static void Streaming_UpdateFlowWindow(bool dropped) {
 
 uint32_t Streaming_GetQuesBits(void) {
     return gQuesBits;  // 32-bit read is atomic on PIC32MZ
+}
+
+void Streaming_IncrDioDropped(void) {
+    gStreamStats.dioDroppedSamples++;  // Single writer (deferred ISR task, pri 8)
+}
+
+void Streaming_IncrEosOverruns(uint32_t missed) {
+    gStreamStats.eosOverruns += missed;  // Single writer (EOS task, pri 8)
 }
 
 uint32_t Streaming_GetLossThreshold(void) {
@@ -1133,7 +1151,7 @@ void streaming_Task(void) {
             }
             else if (pRunTimeStreamConf->Encoding == Streaming_Json) {
                 DIO_TIMING_TEST_WRITE_STATE(1);
-                packetSize = Json_Encode(pBoardData, &nanopbFlag, (uint8_t *) buffer, maxSize); 
+                packetSize = Json_Encode(pBoardData, &nanopbFlag, (uint8_t *) buffer, maxSize);
                 DIO_TIMING_TEST_WRITE_STATE(0);
             } else {
                 DIO_TIMING_TEST_WRITE_STATE(1);
@@ -1143,6 +1161,16 @@ void streaming_Task(void) {
         }
         if (packetSize == 0 && nanopbFlag.Size > 0 && (AINDataAvailable || DIODataAvailable)) {
             gStreamStats.encoderFailures++;
+            // Each encoder pops exactly 1 sample per call. On failure that
+            // sample is freed back to the pool but its data is lost (#297).
+            // Counting 1 per failure avoids the race condition where the
+            // higher-priority deferred ISR task pushes new samples between
+            // queue depth reads, making a delta approach inaccurate.
+            // Count for both AIN and DIO encoder failures — any sample type
+            // consumed by a failed encode is lost.
+            gStreamStats.encoderDroppedSamples++;
+            LOG_E_SESSION(LOG_SESSION_ENCODER_SAMPLE_LOSS,
+                "Streaming: encoder failure lost 1 sample");
             // Critical section: gQuesBits is also RMW'd by deferred ISR task
             taskENTER_CRITICAL();
             gQuesBits |= QUES_BIT_ENCODER_FAIL;
